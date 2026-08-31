@@ -6,7 +6,7 @@ import type { DelegationLane, LaunchRequest, ParentReport, RunRecord, RuntimeCon
 import { closeHerdrWorker, continueLiveHerdr, herdrAgentStatus, herdrTopology, launchInHerdr, listHerdrAgents, paneAlive, readHerdrAgent, resolveHerdrRepo } from "./herdr.js";
 import { LaunchOutcomeUnknownError, systemRunner, type CommandRunner } from "./launch.js";
 import { liveTaskStatus } from "./live_status.js";
-import { continuationPrompt, workerPrompt, type WorkerAuthorization } from "./prompts.js";
+import { workerPrompt, type WorkerAuthorization } from "./prompts.js";
 import { closeTmuxWorker, continueLiveTmux, launchInTmux } from "./tmux.js";
 
 const REPORT_KINDS = new Set<ParentReportKind>(["started", "progress", "needs_user", "completed", "failed"]);
@@ -277,18 +277,15 @@ export function createRuntimeServer(config: RuntimeConfig, token: string, runner
         const owner = routerFor(config, auth(req)); if (!owner) return json(res, 401, { error: "unauthorized" });
         const input = await body(req); if (typeof input?.paneId !== "string" || typeof input?.prompt !== "string" || !input.prompt.trim() || Buffer.byteLength(input.prompt) > 16000) throw new Error("paneId and prompt are required; prompt must be <= 16000 bytes");
         const liveSnapshot=liveTaskStatus(config,runner),live=liveSnapshot.tasks.find(task=>task.paneId===input.paneId);if(!live)return json(res,404,{error:"live task pane not found"});
-        const managedRun=loadRuns(config).find(run=>(run.backend==="herdr"?run.herdrPane:run.tmuxPane)===input.paneId),managedTask=managedRun?records<TaskRecord>(pathFor(config,"parent-tasks.jsonl")).find(task=>task.runId===managedRun.id):undefined,activeManaged=managedRun&&managedTask?.status==="running"&&Boolean(managedTask.reportCapability);let prompt:string;
+        const managedRun=loadRuns(config).find(run=>(run.backend==="herdr"?run.herdrPane:run.tmuxPane)===input.paneId),managedTask=managedRun?records<TaskRecord>(pathFor(config,"parent-tasks.jsonl")).find(task=>task.runId===managedRun.id):undefined,activeManaged=managedRun&&managedTask?.status==="running"&&Boolean(managedTask.reportCapability);const prompt=input.prompt;
         if(activeManaged&&managedTask.authorizationId)throw new Error("authorized sensitive workers cannot be continued; request a fresh exact authorization");
-        if(activeManaged&&managedTask.routerId===owner.routerId&&managedTask.chatId===owner.chatId){
-          if(managedRun.ownsPane===false){const reporting={url:`${runtimeBaseURL(config)}/v1/reports`,capability:managedTask.reportCapability,runId:managedRun.id};writeReportCredentials(config,input.paneId,reporting);prompt=continuationPrompt(input.prompt.trim());}else prompt=continuationPrompt(input.prompt.trim());
-        }else if(activeManaged){
-          prompt=continuationPrompt(input.prompt.trim());
-        }else{
+        if(activeManaged&&managedTask.routerId===owner.routerId&&managedTask.chatId===owner.chatId&&managedRun.ownsPane===false){const reporting={url:`${runtimeBaseURL(config)}/v1/reports`,capability:managedTask.reportCapability,runId:managedRun.id};writeReportCredentials(config,input.paneId,reporting);}
+        if(!activeManaged){
           requireActiveSlot(config,owner);const runId=`run_${current.getTime().toString(36)}_${randomBytes(5).toString("hex")}`,reportCapability=randomBytes(32).toString("base64url"),createdAt=current.toISOString(),backend=liveSnapshot.backend;
           const record:TaskRecord={id:`task_${runId}`,runId,routerId:owner.routerId,chatId:owner.chatId,task:input.prompt.trim(),label:live.name,lane:"full_ai",reportCapability,createdAt,updatedAt:createdAt,status:"running",lastObservedStatus:live.status};
           const run:RunRecord={id:runId,name:live.name,agent:live.agent,repo:workerCwd(config),backend,status:"running",ownsPane:false,createdAt,...(backend==="herdr"?{herdrSession:config.herdrSession||"default",herdrPane:input.paneId}:{tmuxSession:config.tmuxSession,tmuxPane:input.paneId})};
           append(pathFor(config,"parent-tasks.jsonl"),record);append(pathFor(config,"runs.jsonl"),run);
-          const reporting={url:`${runtimeBaseURL(config)}/v1/reports`,capability:reportCapability,runId};writeReportCredentials(config,input.paneId,reporting);prompt=continuationPrompt(input.prompt.trim());
+          const reporting={url:`${runtimeBaseURL(config)}/v1/reports`,capability:reportCapability,runId};writeReportCredentials(config,input.paneId,reporting);
           try{if(backend==="herdr")continueLiveHerdr(config,config.herdrSession||"default",input.paneId,prompt,runner);else continueLiveTmux(config,input.paneId,prompt,runner);}catch(err){if(!(err instanceof LaunchOutcomeUnknownError)){replace(pathFor(config,"parent-tasks.jsonl"),records<TaskRecord>(pathFor(config,"parent-tasks.jsonl")).filter(task=>task.runId!==runId));replace(pathFor(config,"runs.jsonl"),records<RunRecord>(pathFor(config,"runs.jsonl")).filter(item=>item.id!==runId));}throw err;}
           return json(res,200,{task:live,continued:true});
         }

@@ -26,7 +26,3 @@ function authorizationSection(authorization?: WorkerAuthorization): string {
 export function workerPrompt(task: string, authorization?: WorkerAuthorization): string {
   return `${WORKER_INTRO} ${SENSITIVE_ACTION_POLICY}\n\n${authorizationSection(authorization)}\n\nTASK:\n${task}`;
 }
-
-export function continuationPrompt(message: string): string {
-  return `Context Drop follow-up:\n${message}\n\nRemember to report progress or completion with: context-drop report "message"`;
-}

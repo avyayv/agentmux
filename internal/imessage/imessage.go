@@ -27,7 +27,7 @@ const (
 	DefaultSyncLimit                   = 20
 	DefaultHistoryTimeoutSeconds       = 30
 	DefaultResponderTimeoutSeconds     = 180
-	MaxTrustedResponderDuration        = 20 * time.Minute
+	MaxTrustedResponderDuration        = 5 * time.Minute
 	DefaultSendTimeoutSeconds          = 60
 	DefaultMaxMessageBytes             = 64 * 1024
 	DefaultMaxReplyBytes               = 8 * 1024
@@ -39,6 +39,7 @@ type Config struct {
 	Enabled                 bool     `json:"enabled"`
 	Trusted                 bool     `json:"trusted,omitempty"`
 	RouterMode              bool     `json:"router_mode,omitempty"`
+	DelegateAll             bool     `json:"delegate_all,omitempty"`
 	YoloMode                bool     `json:"yolo_mode,omitempty"`
 	ChatID                  string   `json:"chat_id"`
 	Recipient               string   `json:"recipient,omitempty"`
@@ -292,6 +293,9 @@ func (cfg Config) PollInterval() time.Duration {
 func Validate(cfg Config) error {
 	if cfg.RouterMode && !cfg.Trusted {
 		return fmt.Errorf("router mode requires a trusted private chat")
+	}
+	if cfg.DelegateAll && !cfg.RouterMode {
+		return fmt.Errorf("delegate-all mode requires router mode")
 	}
 	if cfg.YoloMode && !cfg.RouterMode {
 		return fmt.Errorf("yolo mode requires router mode")

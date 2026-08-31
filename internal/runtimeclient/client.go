@@ -123,6 +123,10 @@ func New() (*Client, error) {
 	return &Client{Address: address, Token: string(bytes.TrimSpace(b)), HTTP: &http.Client{Timeout: 10 * time.Second}}, nil
 }
 func (c *Client) do(ctx context.Context, method, path string, in, out any, status int) error {
+	return c.doWithToken(ctx, c.Token, method, path, in, out, status)
+}
+
+func (c *Client) doWithToken(ctx context.Context, token, method, path string, in, out any, status int) error {
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
@@ -135,7 +139,7 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any, statu
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.Token)
+	req.Header.Set("Authorization", "Bearer "+token)
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -167,6 +171,35 @@ func (c *Client) IssueRouterCapability(ctx context.Context, routerID, chatID str
 	}
 	err := c.do(ctx, http.MethodPost, "/v1/router-capabilities", map[string]string{"routerId": routerID, "chatId": chatID}, &out, http.StatusCreated)
 	return out.Capability, err
+}
+
+func (c *Client) Delegate(ctx context.Context, capability, prompt, name string) (ManagedTask, error) {
+	var out struct {
+		Task ManagedTask `json:"task"`
+	}
+	request := map[string]string{"prompt": prompt, "name": name}
+	err := c.doWithToken(ctx, capability, http.MethodPost, "/v1/tasks/delegate", request, &out, http.StatusCreated)
+	return out.Task, err
+}
+
+func (c *Client) ActiveTask(ctx context.Context, capability string) (ManagedTask, bool, error) {
+	var out struct {
+		Task *ManagedTask `json:"task"`
+	}
+	err := c.doWithToken(ctx, capability, http.MethodGet, "/v1/tasks/active", nil, &out, http.StatusOK)
+	if err != nil || out.Task == nil {
+		return ManagedTask{}, false, err
+	}
+	return *out.Task, true, nil
+}
+
+func (c *Client) ContinueTask(ctx context.Context, capability, paneID, prompt string) (ManagedTask, error) {
+	var out struct {
+		Task ManagedTask `json:"task"`
+	}
+	request := map[string]string{"paneId": paneID, "prompt": prompt}
+	err := c.doWithToken(ctx, capability, http.MethodPost, "/v1/tasks/continue", request, &out, http.StatusOK)
+	return out.Task, err
 }
 func (c *Client) LeaseReport(ctx context.Context, routerID, chatID string) (ParentReport, bool, error) {
 	return c.LeaseReportFor(ctx, routerID, chatID, 0)

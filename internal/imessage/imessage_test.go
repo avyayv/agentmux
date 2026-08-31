@@ -97,6 +97,14 @@ func testConfig(t *testing.T) Config {
 	return cfg
 }
 
+func TestDelegateAllRequiresRouterMode(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.DelegateAll = true
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "delegate-all mode requires router mode") {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
 func TestRespondToWorkerReportPreparesColdResponderBeforeResponding(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.RouterMode = true
@@ -256,6 +264,9 @@ func TestRouterModeIncrementalPromptInjectsOrchestratorInstructions(t *testing.T
 }
 
 func TestTrustedPersistentResponderBudgetCapsExcessiveConfiguredTimeout(t *testing.T) {
+	if MaxTrustedResponderDuration != 5*time.Minute {
+		t.Fatalf("trusted responder ceiling = %v, want 5m", MaxTrustedResponderDuration)
+	}
 	cfg := testConfig(t)
 	cfg.Trusted = true
 	cfg.ResponderTimeoutSeconds = 1200

@@ -109,6 +109,25 @@ test("router capability is scoped and rotates", async () => {
   } finally { await close(server); }
 });
 
+test("active task lookup is scoped to one router conversation", async () => {
+  const c={...config(),defaultBackend:"herdr" as const};
+  seedHerdrOwner(c,{id:"run-active",pane:"managed:p1"});
+  const liveRunner:CommandRunner={run(_command,args){if(args[2]==="agent"&&args[3]==="list")return{status:0,stdout:JSON.stringify({result:{agents:[{pane_id:"managed:p1",agent:"mock",agent_status:"working",focused:false}]}})};return{status:0};}};
+  const server=createRuntimeServer(c,"secret",liveRunner);
+  await new Promise<void>(resolve=>server.listen(0,"127.0.0.1",resolve));
+  const address=server.address();assert.ok(address&&typeof address==="object");
+  const base=`http://127.0.0.1:${address.port}`,headers={authorization:"Bearer secret","content-type":"application/json"};
+  try {
+    const owner=await issue(base,headers);
+    const response=await fetch(base+"/v1/tasks/active",{headers:{authorization:`Bearer ${owner}`}});
+    assert.equal(response.status,200);
+    assert.equal((await response.json() as any).task.paneId,"managed:p1");
+    const other=await issue(base,headers,"router-b","chat-b");
+    const empty=await fetch(base+"/v1/tasks/active",{headers:{authorization:`Bearer ${other}`}});
+    assert.deepEqual(await empty.json(),{task:null});
+  } finally { await close(server); }
+});
+
 test("router delegation is always fully managed full-AI in the configured Herdr session and accepts a configured agent", async () => {
   const c={...config(),defaultBackend:"herdr" as const,herdrSession:"configured-session",agents:{mock:{command:["mock-agent","{prompt_file}"]},codex:{command:["codex","{prompt_file}"]}}};const calls:string[][]=[];let live=false;const recording:CommandRunner={run(command,args){if(command==="herdr")calls.push(args);if(args[2]==="workspace"&&args[3]==="list")return{status:0,stdout:JSON.stringify({result:{workspaces:[{workspace_id:"managed",label:"ContextDropManaged",focused:false}]}})};if(args[2]==="tab"&&args[3]==="create")return{status:0,stdout:JSON.stringify({result:{tab:{tab_id:"managed:t2"},root_pane:{pane_id:"managed:p2"}}})};if(args[2]==="pane"&&args[3]==="run"){live=true;return{status:0}};if(args[2]==="agent"&&args[3]==="list")return{status:0,stdout:JSON.stringify({result:{agents:live?[{pane_id:"managed:p2",agent:"codex",agent_status:"working",focused:false}]:[]}})};return{status:0};}};const server=createRuntimeServer(c,"secret",recording);await new Promise<void>(r=>server.listen(0,"127.0.0.1",r));const a=server.address();assert.ok(a&&typeof a==="object");const base=`http://127.0.0.1:${a.port}`,headers={authorization:"Bearer secret","content-type":"application/json"};try{const cap=await issue(base,headers);const response=await fetch(base+"/v1/tasks/delegate",{method:"POST",headers:{authorization:`Bearer ${cap}`,"content-type":"application/json"},body:JSON.stringify({agent:"codex",prompt:"ordinary research",name:"Research"})});assert.equal(response.status,201);assert.deepEqual((await response.json() as any).task,{paneId:"managed:p2",agent:"codex",name:"Research",status:"running",selected:false,fullyManaged:true});const run=JSON.parse(readFileSync(join(c.stateDir,"runs.jsonl"),"utf8"));assert.equal(run.lane,"full_ai");assert.equal(run.herdrWorkspace,"managed");assert.equal(run.herdrSession,"configured-session");assert.ok(calls.every(args=>args[1]==="configured-session"));const invalid=await fetch(base+"/v1/tasks/delegate",{method:"POST",headers:{authorization:`Bearer ${cap}`,"content-type":"application/json"},body:JSON.stringify({agent:"missing",prompt:"bad"})});assert.equal(invalid.status,400);}finally{await close(server);}
 });

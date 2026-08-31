@@ -62,6 +62,9 @@ type RuntimeLauncher interface {
 type DelegationRuntime interface {
 	Health(context.Context) error
 	IssueRouterCapability(context.Context, string, string) (string, error)
+	Delegate(context.Context, string, string, string) (runtimeclient.ManagedTask, error)
+	ActiveTask(context.Context, string) (runtimeclient.ManagedTask, bool, error)
+	ContinueTask(context.Context, string, string, string) (runtimeclient.ManagedTask, error)
 	LeaseReport(context.Context, string, string) (runtimeclient.ParentReport, bool, error)
 	FinishReport(context.Context, runtimeclient.ParentReport, string, string, bool) error
 	AutoAuthorize(context.Context, runtimeclient.ParentReport, string, string) (runtimeclient.Run, string, error)
@@ -80,6 +83,8 @@ type Runner struct {
 	MessageWatchRetryMax     time.Duration
 	MessageWatchFailureLimit int
 	mu                       sync.Mutex
+	routerMu                 sync.RWMutex
+	routerCapability         string
 	messagePollMu            sync.Mutex
 	messageWorkerOnce        sync.Once
 	messageQueue             chan messageBatch
@@ -898,6 +903,8 @@ func (r *Runner) processMessage(ctx context.Context, message imessage.Message) {
 	if r.IMessage.Config.RouterMode {
 		if confirmationReply, handled := r.confirmSensitiveAction(ctx, message.ChatID, message.Text); handled {
 			response.Reply = confirmationReply
+		} else if r.IMessage.Config.DelegateAll {
+			response.Reply, responderErr = r.delegateMessage(ctx, message)
 		} else {
 			response, responderErr = r.IMessage.RespondMeasured(ctx, message)
 		}

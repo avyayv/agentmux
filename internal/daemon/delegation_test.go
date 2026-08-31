@@ -36,6 +36,9 @@ type fakeDelegationRuntime struct {
 	autoOutcome     string
 	autoErr         error
 	autoCalls       int
+	activeTask      runtimeclient.ManagedTask
+	delegated       []string
+	continued       []string
 }
 
 func (f *fakeDelegationRuntime) Health(context.Context) error {
@@ -50,6 +53,17 @@ func (f *fakeDelegationRuntime) Health(context.Context) error {
 func (f *fakeDelegationRuntime) IssueRouterCapability(context.Context, string, string) (string, error) {
 	f.issued++
 	return "cap", nil
+}
+func (f *fakeDelegationRuntime) Delegate(_ context.Context, _ string, prompt, _ string) (runtimeclient.ManagedTask, error) {
+	f.delegated = append(f.delegated, prompt)
+	return runtimeclient.ManagedTask{PaneID: "worker-1", Status: "running", FullyManaged: true}, nil
+}
+func (f *fakeDelegationRuntime) ActiveTask(context.Context, string) (runtimeclient.ManagedTask, bool, error) {
+	return f.activeTask, f.activeTask.PaneID != "", nil
+}
+func (f *fakeDelegationRuntime) ContinueTask(_ context.Context, _ string, _ string, prompt string) (runtimeclient.ManagedTask, error) {
+	f.continued = append(f.continued, prompt)
+	return f.activeTask, nil
 }
 func (f *fakeDelegationRuntime) LeaseReport(_ context.Context, router, chat string) (runtimeclient.ParentReport, bool, error) {
 	f.mu.Lock()
@@ -270,7 +284,7 @@ func TestReportDeliveryUsesHTTPLeaseReleaseAndAck(t *testing.T) {
 	runner := &Runner{Delegation: client, IMessage: &imessage.Adapter{Config: cfg, Commander: commander, PersistentResponder: &recordingResponder{}}}
 	runner.deliverReportsOnce(context.Background())
 	runner.deliverReportsOnce(context.Background())
-	if releases != 1 || acks != 1 || len(commander.sends) != 1 || releaseErrorClass != "transient" || leaseSeconds < 20*60+cfg.SendTimeoutSeconds {
+	if releases != 1 || acks != 1 || len(commander.sends) != 1 || releaseErrorClass != "transient" || leaseSeconds < int(imessage.MaxTrustedResponderDuration/time.Second)+cfg.SendTimeoutSeconds {
 		t.Fatalf("releases=%d acks=%d errorClass=%q leaseSeconds=%d sends=%v", releases, acks, releaseErrorClass, leaseSeconds, commander.sends)
 	}
 }
@@ -466,6 +480,49 @@ func TestActiveTaskDoesNotInterceptCasualRouterMessage(t *testing.T) {
 	}
 }
 
+func TestDelegateAllStartsWorkerWithoutRunningRouterTurn(t *testing.T) {
+	commander := &reportCommander{}
+	responder := &recordingResponder{}
+	backend := &fakeDelegationRuntime{}
+	cfg := imessage.Defaults()
+	cfg.Enabled = true
+	cfg.Trusted = true
+	cfg.RouterMode = true
+	cfg.DelegateAll = true
+	cfg.ChatID = "chat"
+	cfg.ImsgPath = "/bin/echo"
+	cfg.ConversationArchiveFile = "/tmp/chat.jsonl"
+	now := time.Now().UTC()
+	store := orchestrator.Store{Path: filepath.Join(t.TempDir(), "state.json")}
+	_ = store.Update(func(st *orchestrator.State) error {
+		st.MessageJobs["1"] = orchestrator.MessageJob{MessageID: "1", ClaimedAt: now}
+		return nil
+	})
+	runner := &Runner{Store: store, Now: func() time.Time { return now }, Delegation: backend, IMessage: &imessage.Adapter{Config: cfg, Commander: commander, PersistentResponder: responder}, routerCapability: "cap"}
+	runner.processMessage(context.Background(), imessage.Message{ID: "1", ChatID: "chat", Text: "research queues"})
+	if len(responder.prompts) != 0 {
+		t.Fatalf("router unexpectedly ran %d turns", len(responder.prompts))
+	}
+	if len(backend.delegated) != 1 || !strings.Contains(backend.delegated[0], "research queues") || !strings.Contains(backend.delegated[0], cfg.ConversationArchiveFile) {
+		t.Fatalf("delegated prompts=%q", backend.delegated)
+	}
+	if !reflect.DeepEqual(commander.sends, []string{"on it — i started a worker."}) {
+		t.Fatalf("sends=%q", commander.sends)
+	}
+}
+
+func TestDelegateAllSteersFollowUpToActiveWorker(t *testing.T) {
+	backend := &fakeDelegationRuntime{activeTask: runtimeclient.ManagedTask{PaneID: "pane-1", Status: "running", FullyManaged: true}}
+	runner := &Runner{Delegation: backend, IMessage: &imessage.Adapter{Config: imessage.Config{}}, routerCapability: "cap"}
+	reply, err := runner.delegateMessage(context.Background(), imessage.Message{Text: "also compare costs"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply != "got it — i sent that to the active worker." || !reflect.DeepEqual(backend.continued, []string{"also compare costs"}) || len(backend.delegated) != 0 {
+		t.Fatalf("reply=%q continued=%q delegated=%q", reply, backend.continued, backend.delegated)
+	}
+}
+
 func TestConfigureRouterHealthGatesAndRotatesOverHTTP(t *testing.T) {
 	t.Setenv("CONTEXT_DROP_HOME", t.TempDir())
 	cfg := imessage.Defaults()
@@ -518,7 +575,7 @@ func TestConfigureRouterHealthGatesAndRotatesOverHTTP(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, second := responder.DelegationEnv()
-	if second != "cap-2" || second == first {
-		t.Fatalf("first=%q second=%q", first, second)
+	if second != "cap-2" || second == first || runner.routerToken() != second {
+		t.Fatalf("first=%q second=%q runner=%q", first, second, runner.routerToken())
 	}
 }

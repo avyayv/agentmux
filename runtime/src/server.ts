@@ -78,6 +78,21 @@ function prepareTask(config: RuntimeConfig, owner: {routerId:string;chatId:strin
   return { id, request, record };
 }
 interface PublicTask { paneId: string; agent: string; name: string; status: "running"; selected: false; fullyManaged: true }
+
+function activeTaskForOwner(config: RuntimeConfig, owner: RouterCapability): PublicTask | undefined {
+  const tasks = records<TaskRecord>(pathFor(config, "parent-tasks.jsonl"))
+    .filter(task => task.routerId === owner.routerId && task.chatId === owner.chatId && task.status === "running")
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const runs = loadRuns(config);
+  for (const task of tasks) {
+    const run = runs.find(item => item.id === task.runId);
+    const paneId = run?.backend === "herdr" ? run.herdrPane : run?.tmuxPane;
+    if (run && paneId) {
+      return { paneId, agent: run.agent, name: task.label || run.name, status: "running", selected: false, fullyManaged: true };
+    }
+  }
+  return undefined;
+}
 function launchPreparedTask(config: RuntimeConfig, prepared: {id:string;request:LaunchRequest;record:TaskRecord}, label: string, current: Date, runner: CommandRunner, options: RuntimeServerOptions): {run:RunRecord;task:PublicTask} {
   const taskPath=pathFor(config,"parent-tasks.jsonl"); append(taskPath,prepared.record); options.afterTaskPersisted?.(prepared.id); let externalStarted=false;
   try { const run=prepared.request.backend==="herdr"?launchInHerdr(config,prepared.request,prepared.id,runner):launchInTmux(config,prepared.request,prepared.id,runner); externalStarted=true; const paneId=run.backend==="herdr"?run.herdrPane:run.tmuxPane;if(!paneId)throw new Error("launched worker did not return a pane ID");const tasks=records<TaskRecord>(taskPath); const persisted=tasks.find(t=>t.runId===prepared.id)!; persisted.status="running"; persisted.updatedAt=current.toISOString(); replace(taskPath,tasks); append(pathFor(config,"runs.jsonl"),run); return {run,task:{paneId,agent:run.agent,name:label,status:"running",selected:false,fullyManaged:true}}; }
@@ -234,6 +249,12 @@ export function createRuntimeServer(config: RuntimeConfig, token: string, runner
       }
       if (req.method === "GET" && url.pathname === "/v1/tasks") {
         if (!routerFor(config, auth(req))) return json(res, 401, { error: "unauthorized" }); const live = liveTaskStatus(config, runner); observeManagedLiveTasks(config, current, runner, live); const saved = records<TaskRecord>(pathFor(config, "parent-tasks.jsonl")); const runs = loadRuns(config); const managedRuns=new Map(runs.flatMap(run=>{const pane=run.backend==="herdr"?run.herdrPane:run.tmuxPane;const rightSession=run.backend!=="herdr"||run.herdrSession===(config.herdrSession||"default");return pane&&rightSession?[[pane,run] as const]:[];})); for(const task of live.tasks){const run=managedRuns.get(task.paneId);if(!run)continue;task.fullyManaged=true;task.name=saved.find(item=>item.runId===run.id)?.label??task.name;} let topology; if (live.backend === "herdr") { try { topology = herdrTopology(config,runner); } catch { /* legacy Herdr/mocks may expose only agent list */ } } return json(res, 200, { tasks:live.tasks, ...(topology ? { topology } : {}) });
+      }
+      if (req.method === "GET" && url.pathname === "/v1/tasks/active") {
+        const owner = routerFor(config, auth(req));
+        if (!owner) return json(res, 401, { error: "unauthorized" });
+        observeManagedLiveTasks(config, current, runner);
+        return json(res, 200, { task: activeTaskForOwner(config, owner) ?? null });
       }
       if (req.method === "GET" && url.pathname === "/v1/herdr/overview") {
         if(!routerFor(config, auth(req)))return json(res, 401, { error: "unauthorized" }); return json(res, 200, { topology: herdrTopology(config,runner) });

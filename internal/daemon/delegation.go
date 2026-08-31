@@ -41,7 +41,43 @@ func (r *Runner) configureRouter(ctx context.Context) error {
 		return fmt.Errorf("delegation runtime does not expose a loopback address")
 	}
 	responder.SetDelegationEnv(strings.TrimRight(client.Address, "/")+"/v1/tasks/delegate", capability)
+	r.routerMu.Lock()
+	r.routerCapability = capability
+	r.routerMu.Unlock()
 	return nil
+}
+
+func (r *Runner) routerToken() string {
+	r.routerMu.RLock()
+	defer r.routerMu.RUnlock()
+	return r.routerCapability
+}
+
+func (r *Runner) delegateMessage(ctx context.Context, message imessage.Message) (string, error) {
+	capability := r.routerToken()
+	if capability == "" {
+		return "", errors.New("router capability is unavailable")
+	}
+
+	active, found, err := r.Delegation.ActiveTask(ctx, capability)
+	if err != nil {
+		return "", fmt.Errorf("find active worker: %w", err)
+	}
+	if found {
+		if _, err := r.Delegation.ContinueTask(ctx, capability, active.PaneID, message.Text); err != nil {
+			return "", fmt.Errorf("continue active worker: %w", err)
+		}
+		return "got it — i sent that to the active worker.", nil
+	}
+
+	prompt := message.Text
+	if archive := strings.TrimSpace(r.IMessage.Config.ConversationArchiveFile); archive != "" {
+		prompt += "\n\nIf earlier conversation context is needed, the authoritative chat archive is available at " + archive + "."
+	}
+	if _, err := r.Delegation.Delegate(ctx, capability, prompt, "iMessage task"); err != nil {
+		return "", fmt.Errorf("start worker: %w", err)
+	}
+	return "on it — i started a worker.", nil
 }
 
 func (r *Runner) configureRouterWithRetry(ctx context.Context, attempts int, delay time.Duration) error {

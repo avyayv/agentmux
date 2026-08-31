@@ -44,6 +44,8 @@ There is no public setup command. An administrator provisions `<CONTEXT_DROP_HOM
 
 Router mode requires a trusted private chat. `delegate_all` also requires router mode. In delegate-all mode the persistent orchestrator remains restricted: it routes reports and confirmations, while disposable workers do the actual tool-using work. Keep `yolo_mode` off unless the operator intentionally accepts its documented sensitive-action risk. Restart the daemon after changing adapter configuration. `context-drop daemon status` reports whether iMessage configuration loaded and whether it is enabled.
 
+When `imsg` history provides message GUIDs, router mode registers opaque thread IDs for recent inbound messages. The router can list active IDs, send a threaded reply, add a targeted Tapback, and attach a delegated task to its originating thread. Raw chat/message GUIDs stay in private runtime state and are never returned by these tools. Threads remain active for seven days, or while associated work is active. Targeted replies and Tapbacks require the operator-managed advanced `imsg` IMCore bridge (`imsg launch`, SIP disabled). Context Drop does not disable SIP or start the bridge, and fails closed without it.
+
 Telegram is not implemented in this release.
 
 ## Server

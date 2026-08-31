@@ -256,6 +256,29 @@ func TestPiRPCResponderPreservesSuccessfulToolEvidenceOnEmptyFinal(t *testing.T)
 	}
 }
 
+func TestPiRPCResponderTracksMessagingSideEffectsOnEmptyFinal(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		tool            string
+		wantThreadReply bool
+	}{
+		{name: "thread reply", tool: "reply_to_thread", wantThreadReply: true},
+		{name: "reaction", tool: "react_to_thread", wantThreadReply: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			responder := &PiRPCResponder{argv: []string{os.Args[0], "-test.run=TestPiRPCHelperProcess"}, env: append(os.Environ(), "CONTEXT_DROP_PI_RPC_HELPER=1", "CONTEXT_DROP_PI_RPC_MESSAGE_COUNT=2", "CONTEXT_DROP_PI_RPC_EMPTY_AFTER_TOOL=1", "CONTEXT_DROP_PI_RPC_TOOL_NAME="+test.tool)}
+			defer responder.Close()
+			if _, err := responder.Prepare(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			response, err := responder.Respond(context.Background(), "message", 1024)
+			if err == nil || !response.ToolCompleted || !response.SideEffectToolCompleted || !response.MessagingSideEffectToolCompleted || response.ThreadReplyToolCompleted != test.wantThreadReply {
+				t.Fatalf("response=%#v err=%v", response, err)
+			}
+		})
+	}
+}
+
 func TestPiRPCResponderDoesNotCountFailedSideEffectTool(t *testing.T) {
 	responder := &PiRPCResponder{argv: []string{os.Args[0], "-test.run=TestPiRPCHelperProcess"}, env: append(os.Environ(), "CONTEXT_DROP_PI_RPC_HELPER=1", "CONTEXT_DROP_PI_RPC_MESSAGE_COUNT=2", "CONTEXT_DROP_PI_RPC_EMPTY_AFTER_TOOL=1", "CONTEXT_DROP_PI_RPC_TOOL_ERROR=1")}
 	defer responder.Close()
@@ -294,8 +317,12 @@ func TestPiRPCHelperProcess(t *testing.T) {
 			prompts++
 			_ = enc.Encode(map[string]any{"id": command.ID, "type": "response", "command": "prompt", "success": true})
 			if os.Getenv("CONTEXT_DROP_PI_RPC_EMPTY_AFTER_TOOL") == "1" {
-				_ = enc.Encode(map[string]any{"type": "tool_execution_start", "toolCallId": "tool-1", "toolName": "delegate_task"})
-				_ = enc.Encode(map[string]any{"type": "tool_execution_end", "toolCallId": "tool-1", "toolName": "delegate_task", "isError": os.Getenv("CONTEXT_DROP_PI_RPC_TOOL_ERROR") == "1"})
+				toolName := os.Getenv("CONTEXT_DROP_PI_RPC_TOOL_NAME")
+				if toolName == "" {
+					toolName = "delegate_task"
+				}
+				_ = enc.Encode(map[string]any{"type": "tool_execution_start", "toolCallId": "tool-1", "toolName": toolName})
+				_ = enc.Encode(map[string]any{"type": "tool_execution_end", "toolCallId": "tool-1", "toolName": toolName, "isError": os.Getenv("CONTEXT_DROP_PI_RPC_TOOL_ERROR") == "1"})
 				_ = enc.Encode(map[string]any{"type": "agent_settled"})
 				continue
 			}

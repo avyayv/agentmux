@@ -884,6 +884,22 @@ func responderFailureReply(err error, response imessage.Response) string {
 }
 
 func (r *Runner) processMessage(ctx context.Context, message imessage.Message) {
+	if registrar, ok := r.Delegation.(interface {
+		RegisterIMessageThread(context.Context, string, string, map[string]string) (string, error)
+	}); ok && message.GUID != "" {
+		threadID, err := registrar.RegisterIMessageThread(ctx, imessageRouterID, r.IMessage.Config.ChatID, map[string]string{
+			"messageGuid":    message.GUID,
+			"threadRootGuid": message.ThreadRootGUID,
+			"chatGuid":       message.ChatGUID,
+			"preview":        message.Text,
+			"createdAt":      message.CreatedAt,
+		})
+		if err != nil {
+			log.Printf("Context Drop iMessage thread registration failed: %v", err)
+		} else {
+			message.ThreadID = threadID
+		}
+	}
 	processingStarted := r.Now()
 	if err := r.Store.Update(func(st *orchestrator.State) error {
 		job := st.MessageJobs[message.ID]
@@ -912,8 +928,11 @@ func (r *Runner) processMessage(ctx context.Context, message imessage.Message) {
 		response, responderErr = r.IMessage.RespondMeasured(ctx, message)
 	}
 	processErr := responderErr
+	if response.MessagingSideEffectToolCompleted {
+		processErr = nil
+	}
 	var sendDuration time.Duration
-	if processErr == nil {
+	if processErr == nil && !response.ThreadReplyToolCompleted && response.Reply != "" && response.Reply != noUserReplyMarker {
 		sendStarted := time.Now()
 		processErr = r.IMessage.Send(ctx, response.Reply)
 		sendDuration = time.Since(sendStarted)
@@ -927,7 +946,7 @@ func (r *Runner) processMessage(ctx context.Context, message imessage.Message) {
 		log.Printf("Context Drop iMessage message %s failed: %v", message.ID, processErr)
 		// Only send a generic error when the responder failed. If `imsg send`
 		// failed after possibly delivering, never send a second reply.
-		if responderErr != nil {
+		if responderErr != nil && !response.MessagingSideEffectToolCompleted {
 			_ = r.IMessage.Send(ctx, responderFailureReply(responderErr, response))
 		}
 	}

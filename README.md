@@ -64,7 +64,9 @@ context-drop daemon restart
 context-drop daemon status
 ```
 
-The daemon ignores prior history during initial sync, durably deduplicates later messages, and never gives workers iMessage credentials. The persistent orchestrator exposes managed task controls plus constrained Herdr topology/read/status and validated-repository launch tools; every prompt and launch still crosses the managed safety/reporting boundary.
+The daemon ignores prior history during initial sync, durably deduplicates later messages, and never gives workers iMessage credentials. The persistent orchestrator exposes managed task controls plus constrained Herdr topology/read/status, validated-repository launch tools, and opaque active-thread tools. It can associate delegated work with the originating iMessage thread and route later worker updates back through that thread without exposing chat or message GUIDs.
+
+Targeted replies and Tapbacks require `imsg`'s advanced IMCore bridge (`imsg launch`), which in turn requires the operator to disable SIP. Context Drop never changes SIP or launches that bridge automatically. Thread actions fail closed when it is unavailable; they do not fall back to an untargeted or “most recent message” action.
 
 ## Worker reports
 

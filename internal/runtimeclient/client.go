@@ -32,6 +32,7 @@ type ParentReport struct {
 	CreatedAt          string `json:"createdAt"`
 	LeaseID            string `json:"leaseId,omitempty"`
 	LifecycleOnly      bool   `json:"lifecycleOnly,omitempty"`
+	ThreadID           string `json:"threadId,omitempty"`
 }
 type Agent struct {
 	Name       string `json:"name"`
@@ -173,11 +174,32 @@ func (c *Client) IssueRouterCapability(ctx context.Context, routerID, chatID str
 	return out.Capability, err
 }
 
+func (c *Client) RegisterIMessageThread(ctx context.Context, routerID, chatID string, message map[string]string) (string, error) {
+	request := map[string]string{"routerId": routerID, "chatId": chatID}
+	for key, value := range message {
+		if value != "" {
+			request[key] = value
+		}
+	}
+	var out struct {
+		ThreadID string `json:"threadId"`
+	}
+	err := c.do(ctx, http.MethodPost, "/v1/imessage/threads/register", request, &out, http.StatusCreated)
+	return out.ThreadID, err
+}
+
 func (c *Client) Delegate(ctx context.Context, capability, prompt, name string) (ManagedTask, error) {
+	return c.DelegateInThread(ctx, capability, prompt, name, "")
+}
+
+func (c *Client) DelegateInThread(ctx context.Context, capability, prompt, name, threadID string) (ManagedTask, error) {
 	var out struct {
 		Task ManagedTask `json:"task"`
 	}
 	request := map[string]string{"prompt": prompt, "name": name}
+	if threadID != "" {
+		request["threadId"] = threadID
+	}
 	err := c.doWithToken(ctx, capability, http.MethodPost, "/v1/tasks/delegate", request, &out, http.StatusCreated)
 	return out.Task, err
 }

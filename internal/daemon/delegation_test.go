@@ -39,6 +39,11 @@ type fakeDelegationRuntime struct {
 	activeTask      runtimeclient.ManagedTask
 	delegated       []string
 	continued       []string
+	registered      []map[string]string
+	registeredOwner [2]string
+	registeredID    string
+	registerErr     error
+	delegatedThread string
 }
 
 func (f *fakeDelegationRuntime) Health(context.Context) error {
@@ -57,6 +62,21 @@ func (f *fakeDelegationRuntime) IssueRouterCapability(context.Context, string, s
 func (f *fakeDelegationRuntime) Delegate(_ context.Context, _ string, prompt, _ string) (runtimeclient.ManagedTask, error) {
 	f.delegated = append(f.delegated, prompt)
 	return runtimeclient.ManagedTask{PaneID: "worker-1", Status: "running", FullyManaged: true}, nil
+}
+func (f *fakeDelegationRuntime) DelegateInThread(ctx context.Context, capability, prompt, name, threadID string) (runtimeclient.ManagedTask, error) {
+	f.delegatedThread = threadID
+	return f.Delegate(ctx, capability, prompt, name)
+}
+func (f *fakeDelegationRuntime) RegisterIMessageThread(_ context.Context, routerID, chatID string, message map[string]string) (string, error) {
+	f.registeredOwner = [2]string{routerID, chatID}
+	f.registered = append(f.registered, message)
+	if f.registerErr != nil {
+		return "", f.registerErr
+	}
+	if f.registeredID == "" {
+		f.registeredID = "thread-test"
+	}
+	return f.registeredID, nil
 }
 func (f *fakeDelegationRuntime) ActiveTask(context.Context, string) (runtimeclient.ManagedTask, bool, error) {
 	return f.activeTask, f.activeTask.PaneID != "", nil
@@ -343,7 +363,7 @@ func TestYoloSafeAutoAuthorizationFailureReleasesForRetry(t *testing.T) {
 }
 
 func TestEveryPlainReportGetsAnUntrustedOrchestratorTurn(t *testing.T) {
-	backend := &fakeDelegationRuntime{reports: []runtimeclient.ParentReport{{ID: "r1", RouterID: imessageRouterID, ChatID: "chat", RunID: "run", Kind: "progress", Message: "ordinary progress"}}}
+	backend := &fakeDelegationRuntime{reports: []runtimeclient.ParentReport{{ID: "r1", RouterID: imessageRouterID, ChatID: "chat", RunID: "run", Kind: "progress", Message: "ordinary progress", ThreadID: "thread-opaque"}}}
 	commander := &reportCommander{}
 	cfg := imessage.Defaults()
 	cfg.Enabled, cfg.RouterMode, cfg.ChatID, cfg.ImsgPath = true, true, "chat", "/bin/echo"
@@ -354,8 +374,21 @@ func TestEveryPlainReportGetsAnUntrustedOrchestratorTurn(t *testing.T) {
 		t.Fatalf("prompts=%v sends=%v finishes=%v", responder.prompts, commander.sends, backend.finishDelivered)
 	}
 	prompt := responder.prompts[0]
-	if !strings.Contains(prompt, "ordinary progress") || !strings.Contains(prompt, "Available task tools remain enabled") || !strings.Contains(prompt, noUserReplyMarker) {
+	if !strings.Contains(prompt, "ordinary progress") || !strings.Contains(prompt, "Available task tools remain enabled") || !strings.Contains(prompt, "active iMessage thread thread-opaque") || !strings.Contains(prompt, noUserReplyMarker) {
 		t.Fatalf("plain report did not reach an ordinary orchestrator turn: %q", prompt)
+	}
+}
+
+func TestThreadReplyReportSideEffectIsAcknowledgedWithoutDuplicateSend(t *testing.T) {
+	backend := &fakeDelegationRuntime{reports: []runtimeclient.ParentReport{{ID: "r1", RouterID: imessageRouterID, ChatID: "chat", RunID: "run", Message: "done", ThreadID: "thread-opaque"}}}
+	commander := &reportCommander{}
+	cfg := imessage.Defaults()
+	cfg.Enabled, cfg.RouterMode, cfg.ChatID, cfg.ImsgPath = true, true, "chat", "/bin/echo"
+	responder := &recordingResponder{fail: 1, response: imessage.Response{ToolCompleted: true, SideEffectToolCompleted: true, MessagingSideEffectToolCompleted: true, ThreadReplyToolCompleted: true}}
+	runner := &Runner{Delegation: backend, IMessage: &imessage.Adapter{Config: cfg, Commander: commander, PersistentResponder: responder}}
+	runner.deliverReportsOnce(context.Background())
+	if len(commander.sends) != 0 || !reflect.DeepEqual(backend.finishDelivered, []bool{true}) {
+		t.Fatalf("sends=%v finishes=%v", commander.sends, backend.finishDelivered)
 	}
 }
 
@@ -437,9 +470,10 @@ func TestSensitiveConfirmationRequiresExactTokenAndChatScopedRuntimeVerification
 }
 
 type recordingResponder struct {
-	prompts []string
-	fail    int
-	reply   string
+	prompts  []string
+	fail     int
+	reply    string
+	response imessage.Response
 }
 
 func (*recordingResponder) Prepare(context.Context) (imessage.PersistentResponderState, error) {
@@ -449,7 +483,10 @@ func (r *recordingResponder) Respond(_ context.Context, p string, _ int) (imessa
 	r.prompts = append(r.prompts, p)
 	if r.fail > 0 {
 		r.fail--
-		return imessage.Response{}, errors.New("orchestrator failed")
+		return r.response, errors.New("orchestrator failed")
+	}
+	if r.response.Reply != "" || r.response.ToolCompleted {
+		return r.response, nil
 	}
 	reply := r.reply
 	if reply == "" {
@@ -458,6 +495,47 @@ func (r *recordingResponder) Respond(_ context.Context, p string, _ int) (imessa
 	return imessage.Response{Reply: reply}, nil
 }
 func (*recordingResponder) Close() error { return nil }
+func TestIncomingMessageRegistersOpaqueThreadAndSuppressesDuplicateReply(t *testing.T) {
+	commander := &reportCommander{}
+	responder := &recordingResponder{reply: noUserReplyMarker}
+	backend := &fakeDelegationRuntime{registeredID: "thread-opaque"}
+	cfg := imessage.Defaults()
+	cfg.Enabled = true
+	cfg.Trusted = true
+	cfg.RouterMode = true
+	cfg.ChatID = "chat"
+	cfg.ImsgPath = "/bin/echo"
+	now := time.Now().UTC()
+	store := orchestrator.Store{Path: filepath.Join(t.TempDir(), "state.json")}
+	if err := store.Update(func(st *orchestrator.State) error {
+		st.MessageJobs["42"] = orchestrator.MessageJob{MessageID: "42", ClaimedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &Runner{Store: store, Now: func() time.Time { return now }, Delegation: backend, IMessage: &imessage.Adapter{Config: cfg, Commander: commander, PersistentResponder: responder}}
+	runner.processMessage(context.Background(), imessage.Message{ID: "42", GUID: "message-guid", ThreadRootGUID: "root-guid", ChatID: "chat", ChatGUID: "chat-guid", Text: "investigate", CreatedAt: "2026-08-31T00:00:00Z"})
+	if backend.registeredOwner != [2]string{imessageRouterID, "chat"} || len(backend.registered) != 1 {
+		t.Fatalf("owner=%v registered=%v", backend.registeredOwner, backend.registered)
+	}
+	if got := backend.registered[0]; got["messageGuid"] != "message-guid" || got["threadRootGuid"] != "root-guid" || got["chatGuid"] != "chat-guid" || got["preview"] != "investigate" {
+		t.Fatalf("registered message=%v", got)
+	}
+	if len(responder.prompts) != 1 || !strings.Contains(responder.prompts[0], "Active iMessage thread ID: thread-opaque") || !strings.Contains(responder.prompts[0], "pass this threadId to delegate_task") {
+		t.Fatalf("prompts=%q", responder.prompts)
+	}
+	if len(commander.sends) != 0 {
+		t.Fatalf("duplicate sends=%q", commander.sends)
+	}
+	state, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.MessageJobs["42"].Status != "sent" {
+		t.Fatalf("job=%+v", state.MessageJobs["42"])
+	}
+}
+
 func TestActiveTaskDoesNotInterceptCasualRouterMessage(t *testing.T) {
 	commander := &reportCommander{}
 	responder := &recordingResponder{}
@@ -508,6 +586,18 @@ func TestDelegateAllStartsWorkerWithoutRunningRouterTurn(t *testing.T) {
 	}
 	if !reflect.DeepEqual(commander.sends, []string{"on it — i started a worker."}) {
 		t.Fatalf("sends=%q", commander.sends)
+	}
+}
+
+func TestDelegateAllPreservesIncomingThreadOnNewWorker(t *testing.T) {
+	backend := &fakeDelegationRuntime{}
+	runner := &Runner{Delegation: backend, IMessage: &imessage.Adapter{Config: imessage.Config{}}, routerCapability: "cap"}
+	reply, err := runner.delegateMessage(context.Background(), imessage.Message{Text: "research", ThreadID: "thread-opaque"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply != "on it — i started a worker." || backend.delegatedThread != "thread-opaque" || !reflect.DeepEqual(backend.delegated, []string{"research"}) {
+		t.Fatalf("reply=%q thread=%q delegated=%q", reply, backend.delegatedThread, backend.delegated)
 	}
 }
 

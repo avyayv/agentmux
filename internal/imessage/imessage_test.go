@@ -151,15 +151,15 @@ func TestRespondToWorkerReportReturnsPrepareFailureWithoutResponding(t *testing.
 
 func TestParseMessagesJSONAndJSONL(t *testing.T) {
 	inputs := [][]byte{
-		[]byte(`{"messages":[{"guid":"a","text":"hello","is_from_me":false,"chat_id":"1"},{"id":2,"body":"sent","direction":"outgoing"}]}`),
-		[]byte("{\"id\":\"a\",\"text\":\"hello\",\"chat_id\":\"1\"}\n{\"id\":2,\"body\":\"sent\",\"direction\":\"outgoing\"}\n"),
+		[]byte(`{"messages":[{"id":1,"guid":"a","text":"hello","is_from_me":false,"chat_id":"1","chat_guid":"chat-guid","thread_originator_guid":"root-guid"},{"id":2,"body":"sent","direction":"outgoing"}]}`),
+		[]byte("{\"id\":1,\"guid\":\"a\",\"text\":\"hello\",\"chat_id\":\"1\",\"chat_guid\":\"chat-guid\",\"thread_originator_guid\":\"root-guid\"}\n{\"id\":2,\"body\":\"sent\",\"direction\":\"outgoing\"}\n"),
 	}
 	for _, input := range inputs {
 		messages, err := ParseMessages(input)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(messages) != 2 || messages[0].ID != "a" || messages[0].Text != "hello" || messages[0].ChatID != "1" || messages[0].FromMe || !messages[1].FromMe {
+		if len(messages) != 2 || messages[0].ID != "1" || messages[0].GUID != "a" || messages[0].ThreadRootGUID != "root-guid" || messages[0].ChatGUID != "chat-guid" || messages[0].Text != "hello" || messages[0].ChatID != "1" || messages[0].FromMe || !messages[1].FromMe {
 			t.Fatalf("messages = %#v", messages)
 		}
 	}

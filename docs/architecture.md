@@ -10,11 +10,11 @@ The daemon starts or connects to a loopback-only Node runtime and rotates a capa
 
 ## Orchestrator runtime
 
-A persistent orchestrator responds to conversation turns and has exactly three task tools: `list_tasks`, `delegate_task`, and `continue_task`. Live status comes only from the configured Herdr or tmux backend and fails visibly when that backend is unavailable.
+A persistent orchestrator responds to conversation turns with constrained task, Herdr inspection, repository-launch, and iMessage thread tools. Live status comes only from the configured Herdr or tmux backend and fails visibly when that backend is unavailable. Thread tools expose random owner-scoped IDs rather than recipients or raw message GUIDs; targeted sends fail closed when the advanced `imsg` bridge is unavailable.
 
 Delegated tasks are fully managed: Context Drop injects scoped reporting context, records their pane, and monitors their lifecycle. Public task identity is the backend pane ID, not a private run ID, prompt path, terminal title, or daemon envelope. Continuation targets any exact live pane, including an unmanaged pane.
 
-Worker `context-drop report` messages are natural language. They enter the owning orchestrator as ordinary untrusted messages. Separately marked daemon lifecycle events cover crashes and disappearing managed panes.
+Worker `context-drop report` messages are natural language. They enter the owning orchestrator as ordinary untrusted messages. When a delegated task carries an active iMessage thread ID, both explicit and lifecycle reports preserve that association so the orchestrator can choose a threaded update. Separately marked daemon lifecycle events cover crashes and disappearing managed panes.
 
 ## TTL upload service
 

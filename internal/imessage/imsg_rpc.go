@@ -47,10 +47,18 @@ func NewIMsgRPCSender(cfg Config) *IMsgRPCSender {
 }
 
 func (s *IMsgRPCSender) Send(ctx context.Context, chatID, text string) error {
+<<<<<<< HEAD
 	rowID, err := strconv.ParseInt(chatID, 10, 64)
 	if err != nil || rowID <= 0 {
 		return errors.New("imsg RPC chat ID must be a positive integer")
 	}
+=======
+	numericChatID, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil || numericChatID <= 0 {
+		return fmt.Errorf("invalid imsg RPC chat ID %q", chatID)
+	}
+
+>>>>>>> fix-imsg-rpc-chat-id
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.unsupported {

@@ -223,7 +223,7 @@ func TestPersistentTurnsContainOnlyMessageText(t *testing.T) {
 	}
 }
 
-func TestRouterModePromptInjectsOrchestratorInstructions(t *testing.T) {
+func TestRouterModePromptKeepsPolicyInSystemPrompt(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Trusted = true
 	cfg.RouterMode = true
@@ -232,14 +232,12 @@ func TestRouterModePromptInjectsOrchestratorInstructions(t *testing.T) {
 	if _, err := adapter.RespondMeasured(context.Background(), Message{ID: "7", Text: "status"}); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Orchestrator instructions", "use list_tasks", "never guess identifiers"} {
-		if !strings.Contains(responder.prompt, want) {
-			t.Fatalf("router prompt missing %q: %q", want, responder.prompt)
-		}
+	if responder.prompt != "status" {
+		t.Fatalf("turn should contain only user text, got %q", responder.prompt)
 	}
 }
 
-func TestRouterModeIncrementalPromptInjectsOrchestratorInstructions(t *testing.T) {
+func TestRouterModeIncrementalPromptKeepsPolicyInSystemPrompt(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Trusted = true
 	cfg.RouterMode = true
@@ -248,10 +246,8 @@ func TestRouterModeIncrementalPromptInjectsOrchestratorInstructions(t *testing.T
 	if _, err := adapter.RespondMeasured(context.Background(), Message{ID: "8", Text: "status"}); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Orchestrator instructions", "use list_tasks", "never guess identifiers"} {
-		if !strings.Contains(responder.prompt, want) {
-			t.Fatalf("incremental router prompt missing %q: %q", want, responder.prompt)
-		}
+	if responder.prompt != "status" {
+		t.Fatalf("turn should contain only user text, got %q", responder.prompt)
 	}
 }
 

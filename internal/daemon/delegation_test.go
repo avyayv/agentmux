@@ -223,7 +223,7 @@ func TestReportDeliveryDoesNotRetryAfterAmbiguousSendFailureAndScopesChat(t *tes
 	}
 }
 
-func TestScheduleOwnedReportDeliversVerbatimWithoutPollutingOrchestrator(t *testing.T) {
+func TestScheduleOwnedReportUsesConversationalResponse(t *testing.T) {
 	backend := &fakeDelegationRuntime{reports: []runtimeclient.ParentReport{{ID: "schedule-report", RouterID: scheduleRouterID, ChatID: "chat", RunID: "run", Message: "scheduled work finished"}}}
 	commander := &reportCommander{}
 	cfg := imessage.Defaults()
@@ -231,7 +231,7 @@ func TestScheduleOwnedReportDeliversVerbatimWithoutPollutingOrchestrator(t *test
 	responder := &recordingResponder{}
 	runner := &Runner{Delegation: backend, IMessage: &imessage.Adapter{Config: cfg, Commander: commander, PersistentResponder: responder}}
 	runner.deliverReportsOnce(context.Background())
-	if len(responder.prompts) != 0 || !reflect.DeepEqual(backend.finishedOwners, [][2]string{{scheduleRouterID, "chat"}}) || !reflect.DeepEqual(commander.sends, []string{"scheduled work finished"}) {
+	if !reflect.DeepEqual(responder.prompts, []string{"scheduled work finished"}) || !reflect.DeepEqual(backend.finishedOwners, [][2]string{{scheduleRouterID, "chat"}}) || !reflect.DeepEqual(commander.sends, []string{"router reply"}) {
 		t.Fatalf("prompts=%v owners=%v sends=%v", responder.prompts, backend.finishedOwners, commander.sends)
 	}
 }
@@ -256,7 +256,7 @@ func TestScheduleOwnedReportRecordsVerifiedDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := state.Jobs[0]
-	if got.DeliveryStatus != "delivered" || got.DeliveryReportID != "report-user" || got.DeliveredAt == nil || !reflect.DeepEqual(commander.sends, []string{"What did you eat and when?"}) {
+	if got.DeliveryStatus != "delivered" || got.DeliveryReportID != "report-user" || got.DeliveredAt == nil || !reflect.DeepEqual(commander.sends, []string{"router reply"}) {
 		t.Fatalf("job=%#v sends=%v", got, commander.sends)
 	}
 }
@@ -278,7 +278,7 @@ func TestDeliveredScheduleReportRetriesOnlyAckAfterReceipt(t *testing.T) {
 	runner.deliverReportsOnce(context.Background())
 	backend.leased = map[string]bool{}
 	runner.deliverReportsOnce(context.Background())
-	if !reflect.DeepEqual(commander.sends, []string{"What did you eat and when?"}) || !reflect.DeepEqual(backend.finishDelivered, []bool{true, true}) {
+	if !reflect.DeepEqual(commander.sends, []string{"router reply"}) || !reflect.DeepEqual(backend.finishDelivered, []bool{true, true}) {
 		t.Fatalf("sends=%v finishes=%v", commander.sends, backend.finishDelivered)
 	}
 }
@@ -333,7 +333,7 @@ func TestScheduleFailureLifecycleMarksFailureAndSendsOneNotice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Jobs[0].Status != "failed" || state.Jobs[0].DeliveryStatus != "failure_notice_delivered" || state.Schedules[0].ConsecutiveFailures != 1 || len(commander.sends) != 1 || !strings.Contains(commander.sends[0], "Schedule meal failed") {
+	if state.Jobs[0].Status != "failed" || state.Jobs[0].DeliveryStatus != "failure_notice_delivered" || state.Schedules[0].ConsecutiveFailures != 1 || len(commander.sends) != 1 || commander.sends[0] != "router reply" {
 		t.Fatalf("state=%#v sends=%v", state, commander.sends)
 	}
 }
@@ -393,7 +393,7 @@ func TestReportDeliveryUsesHTTPLeaseAndAbandonsAmbiguousSend(t *testing.T) {
 	runner := &Runner{Delegation: client, IMessage: &imessage.Adapter{Config: cfg, Commander: commander, PersistentResponder: &recordingResponder{}}}
 	runner.deliverReportsOnce(context.Background())
 	runner.deliverReportsOnce(context.Background())
-	if releases != 1 || acks != 1 || len(commander.sends) != 1 || releaseErrorClass != "transient" || leaseSeconds < int(imessage.MaxTrustedResponderDuration/time.Second)+cfg.SendTimeoutSeconds {
+	if releases != 1 || acks != 0 || len(commander.sends) != 0 || releaseErrorClass != "ambiguous" || leaseSeconds < int(imessage.MaxTrustedResponderDuration/time.Second)+cfg.SendTimeoutSeconds {
 		t.Fatalf("releases=%d acks=%d errorClass=%q leaseSeconds=%d sends=%v", releases, acks, releaseErrorClass, leaseSeconds, commander.sends)
 	}
 }
@@ -561,7 +561,7 @@ func (r *recordingResponder) Respond(_ context.Context, p string, _ int) (imessa
 func (*recordingResponder) Close() error { return nil }
 func TestIncomingMessageRegistersOpaqueThreadAndSuppressesDuplicateReply(t *testing.T) {
 	commander := &reportCommander{}
-	responder := &recordingResponder{reply: ""}
+	responder := &recordingResponder{response: imessage.Response{ToolCompleted: true, MessagingSideEffectToolCompleted: true, ThreadReplyToolCompleted: true}}
 	backend := &fakeDelegationRuntime{registeredID: "thread-opaque"}
 	cfg := imessage.Defaults()
 	cfg.Enabled = true

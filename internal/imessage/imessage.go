@@ -483,6 +483,9 @@ func (a Adapter) RespondMeasured(ctx context.Context, message Message) (Response
 	}
 	promptStarted := time.Now()
 	prompt := message.Text
+	if message.ThreadID != "" {
+		prompt = incomingMessagePrompt(message)
+	}
 	promptBuild := time.Since(promptStarted)
 	if a.PersistentResponder != nil {
 		response, respondErr := a.PersistentResponder.Respond(respondCtx, prompt, a.Config.MaxReplyBytes)

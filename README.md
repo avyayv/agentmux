@@ -109,6 +109,8 @@ context-drop schedule add \
   --notify
 
 context-drop schedule list
+context-drop schedule test-watch        # show a schedule's stored prompt
+context-drop schedule test-watch "New prompt text"  # update only the prompt
 context-drop schedule run test-watch
 context-drop schedule remove test-watch
 ```

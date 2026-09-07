@@ -3,7 +3,7 @@ import { timingSafeEqual, randomBytes, createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, mkdirSync, writeFileSync, chmodSync, renameSync, rmSync, statSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import type { DelegationLane, LaunchRequest, ParentReport, RunRecord, RuntimeConfig, ParentReportKind, SensitiveAction } from "./types.js";
-import { closeHerdrWorker, continueLiveHerdr, herdrAgentStatus, herdrTopology, launchInHerdr, listHerdrAgents, paneAlive, readHerdrAgent, resolveHerdrRepo } from "./herdr.js";
+import { cleanupHerdrLaunch, closeHerdrWorker, continueLiveHerdr, herdrAgentStatus, herdrTopology, launchInHerdr, listHerdrAgents, paneAlive, readHerdrAgent, resolveHerdrRepo, waitForHerdrAgent } from "./herdr.js";
 import { LaunchOutcomeUnknownError, systemRunner, type CommandRunner } from "./launch.js";
 import { liveTaskStatus } from "./live_status.js";
 import { scheduledWorkerPrompt, workerPrompt, type WorkerAuthorization } from "./prompts.js";
@@ -14,7 +14,11 @@ const REPORT_KINDS = new Set<ParentReportKind>(["started", "progress", "needs_us
 const SENSITIVE_ACTIONS = new Set<SensitiveAction>(["payment_or_purchase", "password_or_mfa", "terms_or_subscription"]);
 const REPORT_LIMIT_PER_HOUR = 60;
 const SCHEDULE_ROUTER_ID = "scheduler";
-const LEASE_MS = 30_000;
+// Legacy clients receive a lease covering the bounded 20-minute responder,
+// the default one-minute send, and a one-minute completion margin. Current
+// daemons request this duration from their configured send timeout. Crash
+// recovery is delayed by the selected bounded lease to avoid duplicate sends.
+const LEASE_MS = 22 * 60_000;
 const CHALLENGE_MS = 10 * 60_000;
 const LAUNCH_TIMEOUT_MS = 2 * 60_000;
 const WORKER_IDLE_TIMEOUT_MS = 24 * 60 * 60_000;
@@ -25,16 +29,17 @@ const MAX_ACTIVE_TASKS_GLOBAL = 256;
 const TERMINAL_HISTORY_LIMIT = 500;
 const PANE_PROBE_COOLDOWN_MS = 60_000;
 const MAX_PANE_PROBES_PER_RECONCILE = 8;
-const AGENT_REGISTRATION_GRACE_MS = 2_000;
+const AGENT_REGISTRATION_GRACE_MS = 15_000;
 interface RouterCapability { id: string; routerId: string; chatId: string; digest: string; createdAt: string; revokedAt?: string }
-interface TaskRecord { id: string; runId: string; routerId: string; chatId: string; task: string; label?: string; lane: DelegationLane; reportCapability: string; createdAt: string; updatedAt: string; status: "launching" | "launch_committed" | "running" | "completed" | "failed" | "launch_failed" | "launch_unknown"; threadId?: string; launchError?: string; authorizationId?: string; authorizationReportId?: string; authorizedAction?: SensitiveAction; authorizedScope?: string; authorizationExpiresAt?: string; pendingTerminalReport?: ParentReport; lastObservedStatus?: string }
+interface TaskRecord { id: string; runId: string; routerId: string; chatId: string; task: string; label?: string; lane: DelegationLane; reportCapability: string; createdAt: string; updatedAt: string; status: "launching" | "launch_committed" | "running" | "cleanup_pending" | "completed" | "failed" | "launch_failed" | "launch_unknown"; threadId?: string; launchError?: string; authorizationId?: string; authorizationReportId?: string; authorizedAction?: SensitiveAction; authorizedScope?: string; authorizationExpiresAt?: string; pendingTerminalReport?: ParentReport; lastObservedStatus?: string; pendingCleanup?: boolean }
 export interface RuntimeRecoveryPolicy { launchTimeoutMs:number; workerIdleTimeoutMs:number; reservationMs:number; pendingReportMaxMs:number }
-export interface RuntimeServerOptions { now?: () => Date; afterTaskPersisted?: (runId: string) => void; afterExternalLaunch?: (runId: string) => void; afterTerminalCommitted?: (runId: string) => void; recovery?:Partial<RuntimeRecoveryPolicy> }
+export interface RuntimeServerOptions { now?: () => Date; afterTaskPersisted?: (runId: string) => void; afterExternalLaunch?: (runId: string) => void; afterPreparedExternalLaunch?: (runId: string) => void; afterTerminalCommitted?: (runId: string) => void; recovery?:Partial<RuntimeRecoveryPolicy>; herdrReadinessMs?:number; herdrReadinessPollMs?:number }
 
 function json(res: ServerResponse, status: number, value: unknown): void { res.writeHead(status, { "content-type": "application/json", "x-content-type-options": "nosniff" }); res.end(JSON.stringify(value)); }
 async function body(req: IncomingMessage): Promise<any> { const chunks: Buffer[] = []; let size = 0; for await (const chunk of req) { const b = Buffer.from(chunk); size += b.length; if (size > 64 * 1024) throw new Error("request too large"); chunks.push(b); } try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { throw new Error("invalid JSON"); } }
 function capMatches(got: string, expected: string): boolean { const a = Buffer.from(got), b = Buffer.from(expected); return a.length > 0 && a.length === b.length && timingSafeEqual(a, b); }
 function digest(value: string): string { return createHash("sha256").update(value).digest("base64url"); }
+export function deterministicRetryJitter(reportId:string,attempt:number,baseMs:number):number { const hash=createHash("sha256").update(reportId+":"+attempt).digest();return hash.readUInt32BE(0)%Math.max(1,Math.floor(baseMs/4)); }
 function auth(req: IncomingMessage): string { return req.headers.authorization?.replace(/^Bearer\s+/i, "") ?? ""; }
 function records<T>(path: string): T[] { if (!existsSync(path)) return []; const out: T[] = []; for (const line of readFileSync(path, "utf8").split("\n")) { if (!line.trim()) continue; try { out.push(JSON.parse(line) as T); } catch {} } return out; }
 function replace<T>(path: string, values: T[]): void { const temp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`; writeFileSync(temp, values.map(v => JSON.stringify(v)).join("\n") + (values.length ? "\n" : ""), { mode: 0o600 }); chmodSync(temp, 0o600); renameSync(temp, path); }
@@ -94,26 +99,78 @@ function activeTaskForOwner(config: RuntimeConfig, owner: RouterCapability): Pub
   }
   return undefined;
 }
+function ensureLaunchReady(config:RuntimeConfig,run:RunRecord,runner:CommandRunner,options:RuntimeServerOptions):void {
+  if(run.backend!=="herdr"||!run.herdrPane)return;
+  try{waitForHerdrAgent(config,run.herdrPane,options.herdrReadinessMs??config.herdrReadinessMs??15_000,options.herdrReadinessPollMs??config.herdrReadinessPollMs??250,runner);}
+  catch(err){
+    if(err instanceof LaunchOutcomeUnknownError)throw err;
+    let cleaned=false;
+    try{cleaned=cleanupHerdrLaunch(config,run,runner);}catch{/* cleanup outcome is unknown */}
+    if(!cleaned)throw new LaunchOutcomeUnknownError(`herdr agent never registered and exact-pane cleanup could not be confirmed: ${err instanceof Error?err.message:"readiness failed"}`);
+    throw err;
+  }
+}
 function launchPreparedTask(config: RuntimeConfig, prepared: {id:string;request:LaunchRequest;record:TaskRecord}, label: string, current: Date, runner: CommandRunner, options: RuntimeServerOptions): {run:RunRecord;task:PublicTask} {
-  const taskPath=pathFor(config,"parent-tasks.jsonl"); append(taskPath,prepared.record); options.afterTaskPersisted?.(prepared.id); let externalStarted=false;
-  try { const run=prepared.request.backend==="herdr"?launchInHerdr(config,prepared.request,prepared.id,runner):launchInTmux(config,prepared.request,prepared.id,runner); externalStarted=true; const paneId=run.backend==="herdr"?run.herdrPane:run.tmuxPane;if(!paneId)throw new Error("launched worker did not return a pane ID");const tasks=records<TaskRecord>(taskPath); const persisted=tasks.find(t=>t.runId===prepared.id)!; persisted.status="running"; persisted.updatedAt=current.toISOString(); replace(taskPath,tasks); append(pathFor(config,"runs.jsonl"),run); return {run,task:{paneId,agent:run.agent,name:label,status:"running",selected:false,fullyManaged:true}}; }
-  catch(err){const tasks=records<TaskRecord>(taskPath);const persisted=tasks.find(t=>t.runId===prepared.id);if(persisted){persisted.status=externalStarted||err instanceof LaunchOutcomeUnknownError?"launch_unknown":"launch_failed";persisted.launchError=err instanceof Error?err.message:"launch failed";persisted.reportCapability="";persisted.updatedAt=current.toISOString();replace(taskPath,tasks);}throw err;}
+  const taskPath=pathFor(config,"parent-tasks.jsonl"),runPath=pathFor(config,"runs.jsonl"); append(taskPath,prepared.record); options.afterTaskPersisted?.(prepared.id); let run:RunRecord|undefined; let externalStarted=false,runPersisted=false;
+  try { run=prepared.request.backend==="herdr"?launchInHerdr(config,prepared.request,prepared.id,runner):launchInTmux(config,prepared.request,prepared.id,runner); externalStarted=true; const paneId=run.backend==="herdr"?run.herdrPane:run.tmuxPane;if(!paneId)throw new Error("launched worker did not return a pane ID");ensureLaunchReady(config,run,runner,options);options.afterPreparedExternalLaunch?.(prepared.id);append(runPath,run);runPersisted=true;const tasks=records<TaskRecord>(taskPath); const persisted=tasks.find(t=>t.runId===prepared.id)!; persisted.status="running"; persisted.updatedAt=current.toISOString(); replace(taskPath,tasks); return {run,task:{paneId,agent:run.agent,name:label,status:"running",selected:false,fullyManaged:true}}; }
+  catch(err){
+    const tasks=records<TaskRecord>(taskPath);const persisted=tasks.find(t=>t.runId===prepared.id);
+    if(persisted){
+      if(externalStarted&&run){
+        // Worker was launched but post-launch persistence failed. Retain RunRecord
+        // and attempt exact owned-pane cleanup before deciding final status.
+        if(!runPersisted){append(runPath,run);runPersisted=true;}
+        let cleaned=false;
+        try{cleaned=run.ownsPane===false?true:run.backend==="herdr"?closeHerdrWorker(config,run,runner):run.backend==="tmux"?closeTmuxWorker(config,run,runner):false;}catch{/* cleanup outcome unknown */}
+        run.status=cleaned?"exited":"unknown";const savedRuns=records<RunRecord>(runPath),savedRun=savedRuns.find(item=>item.id===run!.id);if(savedRun){savedRun.status=run.status;replace(runPath,savedRuns);}
+        if(cleaned){persisted.status="launch_failed";if(err instanceof LaunchOutcomeUnknownError)err=new Error(`launch failed after external start; owned-pane cleanup confirmed: ${err.message}`);}
+        else{persisted.status="launch_unknown";if(!(err instanceof LaunchOutcomeUnknownError))err=new LaunchOutcomeUnknownError(`post-launch persistence failed and owned-pane cleanup could not be confirmed: ${err instanceof Error?err.message:"unknown"}`);}
+      }else{
+        persisted.status=err instanceof LaunchOutcomeUnknownError?"launch_unknown":"launch_failed";
+      }
+      persisted.launchError=err instanceof Error?err.message:"launch failed";persisted.reportCapability="";persisted.updatedAt=current.toISOString();replace(taskPath,tasks);
+    }
+    throw err;
+  }
+}
+function persistRunRecord(config:RuntimeConfig,run:RunRecord):void {
+  const runPath=pathFor(config,"runs.jsonl"),runs=records<RunRecord>(runPath),existing=runs.find(item=>item.id===run.id);
+  if(existing)Object.assign(existing,run);else runs.push(run);
+  replace(runPath,runs);
+}
+function recoverAuthorizedPostLaunch(config:RuntimeConfig,taskPath:string,run:RunRecord,cause:unknown,current:Date,runner:CommandRunner):LaunchOutcomeUnknownError {
+  // Authorization was consumed before external launch. Retain the exact run identity,
+  // revoke reporting, and never make this confirmation replayable even if cleanup succeeds.
+  try{persistRunRecord(config,run);}catch{/* task identity below remains durable when run persistence is unavailable */}
+  const tasks=records<TaskRecord>(taskPath),task=tasks.find(item=>item.runId===run.id);
+  if(task){task.status="launch_unknown";task.launchError=cause instanceof Error?cause.message:"authorized launch outcome is unknown";task.reportCapability="";task.updatedAt=current.toISOString();try{replace(taskPath,tasks);}catch{/* cleanup must still be attempted after task persistence failure */}}
+  let cleaned=false;
+  try{cleaned=run.ownsPane===false?true:run.backend==="herdr"?closeHerdrWorker(config,run,runner):run.backend==="tmux"?closeTmuxWorker(config,run,runner):false;}catch{/* cleanup outcome is unknown */}
+  run.status=cleaned?"exited":"unknown";
+  try{persistRunRecord(config,run);}catch{/* the launch_unknown task still prevents authorization replay */}
+  const detail=cause instanceof Error?cause.message:"unknown persistence failure";
+  const message=cleaned?`authorized launch persistence failed after external start; exact owned-pane cleanup confirmed: ${detail}`:`authorized launch persistence failed after external start and exact owned-pane cleanup could not be confirmed: ${detail}`;
+  // Retry the task transition after cleanup as well, covering a one-shot failure of
+  // the original running-task commit or the first recovery write.
+  const finalTasks=records<TaskRecord>(taskPath),finalTask=finalTasks.find(item=>item.runId===run.id);
+  if(finalTask){finalTask.status="launch_unknown";finalTask.launchError=message;finalTask.reportCapability="";finalTask.updatedAt=current.toISOString();try{replace(taskPath,finalTasks);}catch{/* consumed challenge still prevents replay */}}
+  return new LaunchOutcomeUnknownError(message);
 }
 function routerFor(config: RuntimeConfig, capability: string): RouterCapability | undefined { const d = digest(capability); return records<RouterCapability>(pathFor(config, "router-capabilities.jsonl")).find(r => !r.revokedAt && capMatches(r.digest, d)); }
-function activeTasks(config:RuntimeConfig):TaskRecord[] { return records<TaskRecord>(pathFor(config,"parent-tasks.jsonl")).filter(t=>t.status==="launching"||t.status==="launch_committed"||t.status==="running"); }
+function activeTasks(config:RuntimeConfig):TaskRecord[] { return records<TaskRecord>(pathFor(config,"parent-tasks.jsonl")).filter(t=>t.status==="launching"||t.status==="launch_committed"||t.status==="running"||t.status==="cleanup_pending"||t.pendingCleanup); }
 function activeThreadIds(config:RuntimeConfig):Set<string> { return new Set(activeTasks(config).filter(task=>task.threadId).map(task=>task.threadId!)); }
 function requireActiveSlot(config:RuntimeConfig,owner:{routerId:string;chatId:string},replacedRunId?:string):void { const active=activeTasks(config).filter(t=>t.runId!==replacedRunId); if(active.length>=MAX_ACTIVE_TASKS_GLOBAL)throw new Error("delegated worker capacity reached"); if(active.filter(t=>t.routerId===owner.routerId&&t.chatId===owner.chatId).length>=MAX_ACTIVE_TASKS_PER_OWNER)throw new Error("delegated worker capacity reached for this chat"); }
 function supersedeAuthorizedSource(config:RuntimeConfig,sourceRunId:string,replacementRunId:string,current:Date,runner:CommandRunner):void {
   try {
     const taskPath=pathFor(config,"parent-tasks.jsonl"),tasks=records<TaskRecord>(taskPath),source=tasks.find(task=>task.runId===sourceRunId);
     if(!source||source.runId===replacementRunId||source.status!=="running")return;
-    source.status="failed";source.launchError=`superseded by authorized continuation ${replacementRunId}`;source.reportCapability="";source.updatedAt=current.toISOString();replace(taskPath,tasks);
+    source.reportCapability="";source.updatedAt=current.toISOString();
     const run=loadRuns(config).find(item=>item.id===sourceRunId);
     let cleanupConfirmed=false;
-    try { cleanupConfirmed=run?.ownsPane===false?true:run?.backend==="herdr"?closeHerdrWorker(config,run,runner):run?.backend==="tmux"?closeTmuxWorker(config,run,runner):false; } catch { /* replacement is committed; cleanup is best effort */ }
-    if(!cleanupConfirmed){
-      try { const saved=records<TaskRecord>(taskPath),task=saved.find(item=>item.runId===sourceRunId);if(task){task.launchError=`superseded by authorized continuation ${replacementRunId}; source worker cleanup could not be confirmed`;replace(taskPath,saved);} } catch { /* never affect the replacement outcome */ }
-    }
+    try { cleanupConfirmed=run?.ownsPane===false?true:run?.backend==="herdr"?closeHerdrWorker(config,run,runner):run?.backend==="tmux"?closeTmuxWorker(config,run,runner):false; } catch { /* replacement is committed; reconciliation will retry */ }
+    source.status=cleanupConfirmed?"failed":"cleanup_pending";
+    source.launchError=cleanupConfirmed?`superseded by authorized continuation ${replacementRunId}`:`superseded by authorized continuation ${replacementRunId}; source worker cleanup is pending`;
+    replace(taskPath,tasks);
   } catch { /* supersession bookkeeping is post-commit and must never affect the replacement */ }
 }
 function finishAuthorizedSupersession(config:RuntimeConfig,reportPath:string,challengeId:string,authorizationId:string,sourceRunId:string,replacementRunId:string,current:Date,runner:CommandRunner):void {
@@ -173,8 +230,28 @@ function reconcileAndCompact(config:RuntimeConfig,current:Date,policy:RuntimeRec
     if(task.pendingTerminalReport){ if(!reports.some(r=>r.id===task.pendingTerminalReport!.id))reports.push(task.pendingTerminalReport); delete task.pendingTerminalReport; }
     if(task.authorizationReportId&&task.authorizationId&&task.status!=="launch_failed") { const challenge=reports.find(r=>r.id===task.authorizationReportId); if(challenge&&!challenge.challengeConsumedAt){challenge.challengeConsumedAt=current.toISOString();challenge.authorizationId=task.authorizationId;} }
   }
+  // Recover interrupted supersessions: if a replacement task is running but the source
+  // was never cleaned up (crash before finishAuthorizedSupersession), transition the source
+  // into cleanup_pending with revoked reporting.
+  const replacementByReport=new Map<string,TaskRecord>();
+  for(const task of tasks){if(task.status==="running"&&task.authorizationReportId)replacementByReport.set(task.authorizationReportId,task);}
+  for(const report of reports){
+    const replacement=replacementByReport.get(report.id);
+    if(!replacement||!replacement.authorizationId||report.authorizationId!==replacement.authorizationId||!report.runId||replacement.runId===report.runId)continue;
+    const source=tasks.find(t=>t.runId===report.runId);
+    if(source&&source.status==="running"&&source.runId!==replacement.runId){
+      source.status="cleanup_pending";source.reportCapability="";source.updatedAt=current.toISOString();
+      source.launchError=`superseded by authorized continuation ${replacement.runId}; source worker cleanup is pending (recovered after restart)`;
+    }
+  }
   for(const task of tasks){
     const age=currentMs-Date.parse(task.updatedAt||task.createdAt);
+    if(task.status==="cleanup_pending"||task.pendingCleanup){
+      const run=runByID.get(task.runId);let cleaned=false;
+      try{cleaned=run?.ownsPane===false?true:run?.backend==="herdr"?closeHerdrWorker(config,run,runner):run?.backend==="tmux"?closeTmuxWorker(config,run,runner):false;}catch{/* retry later */}
+      if(cleaned){if(task.status==="cleanup_pending"){task.status="failed";task.launchError=(task.launchError??"superseded worker").replace("source worker cleanup is pending","source worker cleanup completed");}delete task.pendingCleanup;task.updatedAt=current.toISOString();}
+      continue;
+    }
     if(task.status==="launch_committed"&&age>=policy.launchTimeoutMs){
       task.status="launch_unknown"; task.launchError="authorized worker launch outcome is unknown; confirmation remains consumed and manual audit is required"; task.reportCapability=""; task.updatedAt=current.toISOString();
       if(!reports.some(r=>r.runId===task.runId&&r.kind==="needs_user")) reports.push({id:`report_${currentMs.toString(36)}_${randomBytes(5).toString("hex")}`,runId:task.runId,routerId:task.routerId,chatId:task.chatId,kind:"needs_user",message:"Sensitive worker launch outcome is unknown. Do not retry this confirmation; audit the external action and explicitly decide next steps.",createdAt:current.toISOString()});
@@ -202,49 +279,31 @@ function reconcileAndCompact(config:RuntimeConfig,current:Date,policy:RuntimeRec
   const keptReports=[...protectedReports,...history].sort((a,b)=>b.createdAt.localeCompare(a.createdAt)); replace(reportsPath,keptReports);
   const protectedRuns=new Set(keptReports.filter(r=>(!r.deliveredAt&&!r.abandonedAt)||(r.challengeToken&&!r.challengeConsumedAt)).map(r=>r.runId));
   tasks.sort((a,b)=>(b.updatedAt||b.createdAt).localeCompare(a.updatedAt||a.createdAt));
-  const activeTasks=tasks.filter(t=>t.status==="launching"||t.status==="launch_committed"||t.status==="running"||protectedRuns.has(t.runId));
+  const activeTasks=tasks.filter(t=>t.status==="launching"||t.status==="launch_committed"||t.status==="running"||t.status==="cleanup_pending"||t.pendingCleanup||protectedRuns.has(t.runId));
   const terminalTasks=tasks.filter(t=>!activeTasks.includes(t)).slice(0,TERMINAL_HISTORY_LIMIT);
   const unique=[...new Map([...activeTasks,...terminalTasks].map(t=>[t.runId,t])).values()].sort((a,b)=>(b.updatedAt||b.createdAt).localeCompare(a.updatedAt||a.createdAt)); replace(tasksPath,unique);
   const caps=records<RouterCapability>(pathFor(config,"router-capabilities.jsonl")); replace(pathFor(config,"router-capabilities.jsonl"),caps.filter(c=>!c.revokedAt).concat(caps.filter(c=>c.revokedAt).slice(-20)));
   const keepRuns=new Set(unique.map(t=>t.runId)); const historicalRuns=runs.filter(r=>!keepRuns.has(r.id)).slice(0,TERMINAL_HISTORY_LIMIT); replace(pathFor(config,"runs.jsonl"),runs.filter(r=>keepRuns.has(r.id)).concat(historicalRuns)); const keptArtifacts=new Set([...keepRuns,...historicalRuns.map(r=>r.id)]); const runRoot=pathFor(config,"runs"); if(existsSync(runRoot)) for(const entry of readdirSync(runRoot)){if(!keptArtifacts.has(entry))rmSync(resolve(runRoot,entry),{recursive:true,force:true});}
 }
 
-function acquireWriterLock(config: RuntimeConfig): string {
-  const lock = pathFor(config, "writer.lock");
-  const recordOwner = () => writeFileSync(resolve(lock, "pid"), String(process.pid) + "\n", { mode: 0o600 });
-  if (!existsSync(lock)) {
-    try { mkdirSync(lock, { mode: 0o700 }); } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      return acquireExistingWriterLock();
-    }
-    recordOwner();
-    return lock;
-  }
-  return acquireExistingWriterLock();
-
-  function acquireExistingWriterLock(): string {
+function acquireWriterLock(config: RuntimeConfig): {lock:string;owner:string} {
+  const lock = pathFor(config, "writer.lock"),ownerToken=randomBytes(16).toString("hex");
+  const recordOwner = () => {writeFileSync(resolve(lock,"pid"),String(process.pid)+"\n",{mode:0o600});writeFileSync(resolve(lock,"owner"),ownerToken+"\n",{mode:0o600});};
+  for(let attempt=0;attempt<3;attempt++){
+    try { mkdirSync(lock, { mode: 0o700 }); recordOwner(); return {lock,owner:ownerToken}; } catch { /* inspect the existing owner */ }
     let owner = 0;
     try { owner = parseInt(readFileSync(resolve(lock, "pid"), "utf8"), 10); } catch { /* unknown owner */ }
-    if (owner > 0) {
-      let alive = true;
-      try { process.kill(owner, 0); } catch (err) { alive = (err as NodeJS.ErrnoException).code === "EPERM"; }
-      if (alive) throw new Error("runtime state is already owned by another writer");
-    }
-    // If the directory vanished, retry acquisition rather than masking ENOENT.
-    let modified: number;
-    try { modified = statSync(lock).mtimeMs; } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return acquireWriterLock(config);
-      throw err;
-    }
-    if (owner <= 0 && Date.now() - modified < 30_000) throw new Error("runtime state is already owned by another writer");
-    rmSync(lock, { recursive: true, force: true });
-    try { mkdirSync(lock, { mode: 0o700 }); } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new Error("runtime state is already owned by another writer");
-      throw err;
-    }
-    recordOwner();
-    return lock;
+    if (owner > 0) { let alive = true; try { process.kill(owner, 0); } catch (err) { alive = (err as NodeJS.ErrnoException).code === "EPERM"; } if (alive) throw new Error("runtime state is already owned by another writer"); }
+    if (owner <= 0 && Date.now() - statSync(lock).mtimeMs < 30_000) throw new Error("runtime state is already owned by another writer");
+    const quarantine=`${lock}.stale.${process.pid}.${randomBytes(6).toString("hex")}`;
+    try{renameSync(lock,quarantine);}catch{continue;}
+    // Once renamed, no later owner can be removed through the canonical path.
+    try { mkdirSync(lock, { mode: 0o700 }); recordOwner(); }
+    catch { rmSync(quarantine,{recursive:true,force:true}); throw new Error("runtime state is already owned by another writer"); }
+    rmSync(quarantine,{recursive:true,force:true});
+    return {lock,owner:ownerToken};
   }
+  throw new Error("runtime state is already owned by another writer");
 }
 
 export function createRuntimeServer(config: RuntimeConfig, token: string, runner: CommandRunner = systemRunner, options: RuntimeServerOptions = {}) {
@@ -351,25 +410,24 @@ export function createRuntimeServer(config: RuntimeConfig, token: string, runner
         if (!general) return json(res, 401, { error: "unauthorized" }); const input=await body(req); const owner=ownerInput(input); const reportPath=pathFor(config,"parent-reports.jsonl"); const reports=records<ParentReport>(reportPath); const challenge=reports.find(r=>r.id===decodeURIComponent(autoAuthorization[1])&&r.routerId===owner.routerId&&r.chatId===owner.chatId&&r.kind==="needs_user"&&r.sensitiveAction&&r.challengedAction&&!r.deliveredAt&&r.leaseUntil&&Date.parse(r.leaseUntil)>current.getTime()&&capMatches(input.leaseId??"",r.leaseId??"")); if(!challenge)return json(res,404,{error:"leased sensitive report not found, expired, or owned by another chat"}); const existingTask=records<TaskRecord>(pathFor(config,"parent-tasks.jsonl")).find(t=>t.authorizationReportId===challenge.id&&t.authorizationId===challenge.authorizationId); if(challenge.challengeConsumedAt){if(existingTask?.status==="running"){const existingRun=loadRuns(config).find(r=>r.id===existingTask.runId);if(existingRun)return json(res,201,{run:existingRun,outcome:"running"});}if(existingTask?.status==="launch_unknown")return json(res,201,{run:{id:existingTask.runId,status:"unknown",lane:existingTask.lane},outcome:"launch_unknown"});return json(res,409,{error:"sensitive report authorization is already consumed"});}
         const tasks=records<TaskRecord>(pathFor(config,"parent-tasks.jsonl")); const original=tasks.find(t=>t.runId===challenge.runId&&t.status==="running"); if(!original)return json(res,409,{error:"sensitive report task is missing or no longer runnable",code:"task_not_runnable"}); if(!challenge.challengeExpiresAt||current.getTime()>=Date.parse(challenge.challengeExpiresAt))return json(res,410,{error:"sensitive report authorization expired",code:"authorization_expired"}); if(challenge.challengeReservationId&&challenge.challengeReservationUntil&&Date.parse(challenge.challengeReservationUntil)>current.getTime())return json(res,409,{error:"sensitive report is already being launched"});
         requireActiveSlot(config,owner,original.runId); const authorization:WorkerAuthorization={id:`auth_${randomBytes(24).toString("base64url")}`,action:challenge.sensitiveAction!,scope:challenge.challengedAction!,expiresAt:challenge.challengeExpiresAt}; const reservationId=randomBytes(16).toString("base64url"); const prepared=prepareTask(config,owner,original.task,original.label??"Delegated task",original.lane??"full_ai",authorization,current); prepared.record.threadId=original.threadId; prepared.record.status="launch_committed";prepared.record.authorizationReportId=challenge.id;const taskPath=pathFor(config,"parent-tasks.jsonl");append(taskPath,prepared.record);challenge.challengeReservationId=reservationId;challenge.challengeReservationUntil=new Date(current.getTime()+policy.reservationMs).toISOString();challenge.authorizationId=authorization.id;challenge.challengeConsumedAt=current.toISOString();replace(reportPath,reports);options.afterTaskPersisted?.(prepared.id);
-        let run:RunRecord; try{run=prepared.request.backend==="herdr"?launchInHerdr(config,prepared.request,prepared.id,runner):launchInTmux(config,prepared.request,prepared.id,runner);}catch(err){const persisted=records<TaskRecord>(taskPath);const task=persisted.find(t=>t.runId===prepared.id);const ambiguous=err instanceof LaunchOutcomeUnknownError;if(task&&task.status==="launch_committed"){task.status=ambiguous?"launch_unknown":"launch_failed";task.launchError=err instanceof Error?err.message:"launch failed";task.reportCapability="";task.updatedAt=current.toISOString();replace(taskPath,persisted);}const retryReports=records<ParentReport>(reportPath);const retryChallenge=retryReports.find(r=>r.id===challenge.id&&r.challengeReservationId===reservationId&&r.authorizationId===authorization.id);if(retryChallenge&&!ambiguous){delete retryChallenge.challengeConsumedAt;delete retryChallenge.challengeReservationId;delete retryChallenge.challengeReservationUntil;delete retryChallenge.authorizationId;replace(reportPath,retryReports);}if(ambiguous){if(retryChallenge){retryChallenge.deliveredAt=current.toISOString();delete retryChallenge.leaseId;delete retryChallenge.leaseUntil;replace(reportPath,retryReports);}}if(!ambiguous)throw err;const audit:ParentReport={id:`report_${current.getTime().toString(36)}_${randomBytes(5).toString("hex")}`,runId:prepared.id,routerId:owner.routerId,chatId:owner.chatId,kind:"needs_user",message:"The YOLO-authorized sensitive worker launch outcome is unknown. Do not retry automatically; audit whether the exact action occurred before deciding what to do next.",createdAt:current.toISOString()};retryReports.push(audit);replace(reportPath,retryReports);return json(res,201,{run:{id:prepared.id,status:"unknown",lane:original.lane},outcome:"launch_unknown"});}
-        try{options.afterExternalLaunch?.(prepared.id);const persisted=records<TaskRecord>(taskPath);const launched=persisted.find(t=>t.runId===prepared.id);if(!launched||launched.status!=="launch_committed")throw new Error("authorized launch commit was lost");append(pathFor(config,"runs.jsonl"),run);launched.status="running";launched.updatedAt=current.toISOString();replace(taskPath,persisted);}catch(err){const recovered=records<TaskRecord>(taskPath);const task=recovered.find(t=>t.runId===prepared.id);if(task){task.status="launch_unknown";task.launchError=err instanceof Error?err.message:"authorized launch outcome is unknown";task.reportCapability="";task.updatedAt=current.toISOString();replace(taskPath,recovered);}const committedChallenge=records<ParentReport>(reportPath);const originalChallenge=committedChallenge.find(r=>r.id===challenge.id&&r.authorizationId===authorization.id);if(originalChallenge){originalChallenge.deliveredAt=current.toISOString();delete originalChallenge.leaseId;delete originalChallenge.leaseUntil;replace(reportPath,committedChallenge);}const auditReports=records<ParentReport>(reportPath);auditReports.push({id:`report_${current.getTime().toString(36)}_${randomBytes(5).toString("hex")}`,runId:prepared.id,routerId:owner.routerId,chatId:owner.chatId,kind:"needs_user",message:"The YOLO-authorized sensitive worker launch outcome is unknown. Do not retry automatically; audit whether the exact action occurred before deciding what to do next.",createdAt:current.toISOString()});replace(reportPath,auditReports);return json(res,201,{run:{id:prepared.id,status:"unknown",lane:original.lane},outcome:"launch_unknown"});}finishAuthorizedSupersession(config,reportPath,challenge.id,authorization.id,original.runId,run.id,current,runner);return json(res,201,{run,outcome:"running",action:authorization.action,scope:authorization.scope,expiresAt:authorization.expiresAt});
+        let run:RunRecord; try{run=prepared.request.backend==="herdr"?launchInHerdr(config,prepared.request,prepared.id,runner):launchInTmux(config,prepared.request,prepared.id,runner);ensureLaunchReady(config,run,runner,options);}catch(err){const persisted=records<TaskRecord>(taskPath);const task=persisted.find(t=>t.runId===prepared.id);const ambiguous=err instanceof LaunchOutcomeUnknownError;if(task&&task.status==="launch_committed"){task.status=ambiguous?"launch_unknown":"launch_failed";task.launchError=err instanceof Error?err.message:"launch failed";task.reportCapability="";task.updatedAt=current.toISOString();replace(taskPath,persisted);}const retryReports=records<ParentReport>(reportPath);const retryChallenge=retryReports.find(r=>r.id===challenge.id&&r.challengeReservationId===reservationId&&r.authorizationId===authorization.id);if(retryChallenge&&!ambiguous){delete retryChallenge.challengeConsumedAt;delete retryChallenge.challengeReservationId;delete retryChallenge.challengeReservationUntil;delete retryChallenge.authorizationId;replace(reportPath,retryReports);}if(ambiguous){if(retryChallenge){retryChallenge.deliveredAt=current.toISOString();delete retryChallenge.leaseId;delete retryChallenge.leaseUntil;replace(reportPath,retryReports);}}if(!ambiguous)throw err;const audit:ParentReport={id:`report_${current.getTime().toString(36)}_${randomBytes(5).toString("hex")}`,runId:prepared.id,routerId:owner.routerId,chatId:owner.chatId,kind:"needs_user",message:"The YOLO-authorized sensitive worker launch outcome is unknown. Do not retry automatically; audit whether the exact action occurred before deciding what to do next.",createdAt:current.toISOString()};retryReports.push(audit);replace(reportPath,retryReports);return json(res,201,{run:{id:prepared.id,status:"unknown",lane:original.lane},outcome:"launch_unknown"});}
+        try{options.afterExternalLaunch?.(prepared.id);const persisted=records<TaskRecord>(taskPath);const launched=persisted.find(t=>t.runId===prepared.id);if(!launched||launched.status!=="launch_committed")throw new Error("authorized launch commit was lost");append(pathFor(config,"runs.jsonl"),run);launched.status="running";launched.updatedAt=current.toISOString();replace(taskPath,persisted);}catch(err){recoverAuthorizedPostLaunch(config,taskPath,run,err,current,runner);const committedChallenge=records<ParentReport>(reportPath);const originalChallenge=committedChallenge.find(r=>r.id===challenge.id&&r.authorizationId===authorization.id);if(originalChallenge){originalChallenge.deliveredAt=current.toISOString();delete originalChallenge.leaseId;delete originalChallenge.leaseUntil;replace(reportPath,committedChallenge);}const auditReports=records<ParentReport>(reportPath);auditReports.push({id:`report_${current.getTime().toString(36)}_${randomBytes(5).toString("hex")}`,runId:prepared.id,routerId:owner.routerId,chatId:owner.chatId,kind:"needs_user",message:"The YOLO-authorized sensitive worker launch outcome is unknown. Do not retry automatically; audit whether the exact action occurred before deciding what to do next.",createdAt:current.toISOString()});replace(reportPath,auditReports);return json(res,201,{run:{id:prepared.id,status:"unknown",lane:original.lane},outcome:"launch_unknown"});}finishAuthorizedSupersession(config,reportPath,challenge.id,authorization.id,original.runId,run.id,current,runner);return json(res,201,{run,outcome:"running",action:authorization.action,scope:authorization.scope,expiresAt:authorization.expiresAt});
       }
       if (req.method === "POST" && url.pathname === "/v1/confirm") {
         if (!general) return json(res, 401, { error: "unauthorized" }); const input = await body(req); const owner = ownerInput(input); if (typeof input.token !== "string") throw new Error("token is required"); const reportPath=pathFor(config,"parent-reports.jsonl"); const reports = records<ParentReport>(reportPath); const challenge = reports.find(r => r.routerId === owner.routerId && r.chatId === owner.chatId && r.challengeToken === input.token && r.kind === "needs_user" && r.sensitiveAction && r.challengedAction && r.deliveredAt && !r.challengeConsumedAt); if (!challenge) return json(res, 404, { error: "confirmation challenge not found, not delivered, expired, or already consumed" });
         if(!challenge.challengeExpiresAt || current.getTime()>=Date.parse(challenge.challengeExpiresAt)) return json(res,410,{error:"confirmation challenge expired"});
         if(challenge.challengeReservationId&&challenge.challengeReservationUntil&&Date.parse(challenge.challengeReservationUntil)>current.getTime()) return json(res,409,{error:"confirmation challenge is already being launched"});
         const tasks = records<TaskRecord>(pathFor(config, "parent-tasks.jsonl")); const original = tasks.find(t => t.runId === challenge.runId && t.status === "running"); if (!original) throw new Error("challenge task is missing or no longer runnable"); requireActiveSlot(config,owner,original.runId); const authorization:WorkerAuthorization={id:`auth_${randomBytes(24).toString("base64url")}`,action:challenge.sensitiveAction!,scope:challenge.challengedAction!,expiresAt:challenge.challengeExpiresAt}; const reservationId=randomBytes(16).toString("base64url");
-        const prepared=prepareTask(config,owner,original.task,original.label??"Delegated task",original.lane??"full_ai",authorization,current); prepared.record.threadId=original.threadId; prepared.record.status="launch_committed"; prepared.record.authorizationReportId=challenge.id; const taskPath=pathFor(config,"parent-tasks.jsonl"); append(taskPath,prepared.record); challenge.challengeReservationId=reservationId; challenge.challengeReservationUntil=new Date(current.getTime()+policy.reservationMs).toISOString(); challenge.authorizationId=authorization.id; challenge.challengeConsumedAt=current.toISOString(); replace(reportPath,reports); options.afterTaskPersisted?.(prepared.id); let run:RunRecord; try { run=prepared.request.backend==="herdr"?launchInHerdr(config,prepared.request,prepared.id,runner):launchInTmux(config,prepared.request,prepared.id,runner); } catch(err){ const persisted=records<TaskRecord>(taskPath); const task=persisted.find(t=>t.runId===prepared.id); if(task&&task.status==="launch_committed"){task.status=err instanceof LaunchOutcomeUnknownError?"launch_unknown":"launch_failed";task.launchError=err instanceof Error?err.message:"launch failed";task.reportCapability="";task.updatedAt=current.toISOString();replace(taskPath,persisted);} const retryReports=records<ParentReport>(reportPath); const retryChallenge=retryReports.find(r=>r.id===challenge.id&&r.challengeReservationId===reservationId&&r.authorizationId===authorization.id); if(retryChallenge&&!(err instanceof LaunchOutcomeUnknownError)){delete retryChallenge.challengeConsumedAt;delete retryChallenge.challengeReservationId;delete retryChallenge.challengeReservationUntil;delete retryChallenge.authorizationId;replace(reportPath,retryReports);} throw err; }
-        try { options.afterExternalLaunch?.(prepared.id); const persisted=records<TaskRecord>(taskPath); const launched=persisted.find(t=>t.runId===prepared.id); if(!launched||launched.status!=="launch_committed") throw new Error("authorized launch commit was lost"); append(pathFor(config,"runs.jsonl"),run); launched.status="running"; launched.updatedAt=current.toISOString(); replace(taskPath,persisted); } catch(err) { const recovered=records<TaskRecord>(taskPath); const task=recovered.find(t=>t.runId===prepared.id); if(task){task.status="launch_unknown";task.launchError=err instanceof Error?err.message:"authorized launch outcome is unknown";task.reportCapability="";task.updatedAt=current.toISOString();replace(taskPath,recovered);} throw err; } finishAuthorizedSupersession(config,reportPath,challenge.id,authorization.id,original.runId,run.id,current,runner); return json(res,201,{run,action:authorization.action,scope:authorization.scope,expiresAt:authorization.expiresAt});
+        const prepared=prepareTask(config,owner,original.task,original.label??"Delegated task",original.lane??"full_ai",authorization,current); prepared.record.threadId=original.threadId; prepared.record.status="launch_committed"; prepared.record.authorizationReportId=challenge.id; const taskPath=pathFor(config,"parent-tasks.jsonl"); append(taskPath,prepared.record); challenge.challengeReservationId=reservationId; challenge.challengeReservationUntil=new Date(current.getTime()+policy.reservationMs).toISOString(); challenge.authorizationId=authorization.id; challenge.challengeConsumedAt=current.toISOString(); replace(reportPath,reports); options.afterTaskPersisted?.(prepared.id); let run:RunRecord; try { run=prepared.request.backend==="herdr"?launchInHerdr(config,prepared.request,prepared.id,runner):launchInTmux(config,prepared.request,prepared.id,runner); ensureLaunchReady(config,run,runner,options); } catch(err){ const persisted=records<TaskRecord>(taskPath); const task=persisted.find(t=>t.runId===prepared.id); if(task&&task.status==="launch_committed"){task.status=err instanceof LaunchOutcomeUnknownError?"launch_unknown":"launch_failed";task.launchError=err instanceof Error?err.message:"launch failed";task.reportCapability="";task.updatedAt=current.toISOString();replace(taskPath,persisted);} const retryReports=records<ParentReport>(reportPath); const retryChallenge=retryReports.find(r=>r.id===challenge.id&&r.challengeReservationId===reservationId&&r.authorizationId===authorization.id); if(retryChallenge&&!(err instanceof LaunchOutcomeUnknownError)){delete retryChallenge.challengeConsumedAt;delete retryChallenge.challengeReservationId;delete retryChallenge.challengeReservationUntil;delete retryChallenge.authorizationId;replace(reportPath,retryReports);} throw err; }
+        try { options.afterExternalLaunch?.(prepared.id); const persisted=records<TaskRecord>(taskPath); const launched=persisted.find(t=>t.runId===prepared.id); if(!launched||launched.status!=="launch_committed") throw new Error("authorized launch commit was lost"); append(pathFor(config,"runs.jsonl"),run); launched.status="running"; launched.updatedAt=current.toISOString(); replace(taskPath,persisted); } catch(err) { throw recoverAuthorizedPostLaunch(config,taskPath,run,err,current,runner); } finishAuthorizedSupersession(config,reportPath,challenge.id,authorization.id,original.runId,run.id,current,runner); return json(res,201,{run,action:authorization.action,scope:authorization.scope,expiresAt:authorization.expiresAt});
       }
       if (req.method === "POST" && url.pathname === "/v1/reports") {
         const input = await body(req); if (typeof input?.runId !== "string" || typeof input.message !== "string" || !input.message.trim() || input.message.length > 4000) throw new Error("invalid report"); if (input.kind !== undefined && !REPORT_KINDS.has(input.kind)) throw new Error("invalid report kind");
         const sensitiveAction = input.sensitiveAction as SensitiveAction | undefined; const challengedAction=typeof input.challengedAction==="string"?input.challengedAction.trim():undefined;
         if (sensitiveAction && (input.kind !== "needs_user" || !SENSITIVE_ACTIONS.has(sensitiveAction) || !challengedAction || challengedAction.length>240)) throw new Error("sensitive needs_user requires a short exact challengedAction"); if(!sensitiveAction && challengedAction) throw new Error("challengedAction requires sensitiveAction");
         const tasks = records<TaskRecord>(pathFor(config, "parent-tasks.jsonl")); const task = tasks.find(t => t.runId === input.runId); if (!task || !["launching","launch_committed","running"].includes(task.status) || !capMatches(auth(req), task.reportCapability)) return json(res, 401, { error: "unauthorized" }); const all = records<ParentReport>(pathFor(config, "parent-reports.jsonl")); if (all.some(r => r.runId === task.runId && (r.kind === "completed" || r.kind === "failed"))) return json(res, 409, { error: "task already terminal" }); const cutoff = current.getTime() - 3600_000; if (all.filter(r => r.runId === task.runId && Date.parse(r.createdAt) >= cutoff).length >= REPORT_LIMIT_PER_HOUR) return json(res, 429, { error: "report rate limit exceeded" });
-        const report: ParentReport = { id: `report_${current.getTime().toString(36)}_${randomBytes(5).toString("hex")}`, runId: task.runId, routerId: task.routerId, chatId: task.chatId, kind: input.kind, message: input.message, sensitiveAction, challengedAction, challengeToken: sensitiveAction ? randomBytes(6).toString("hex").toUpperCase() : undefined, challengeExpiresAt:sensitiveAction?new Date(current.getTime()+CHALLENGE_MS).toISOString():undefined, createdAt: current.toISOString(), threadId:task.threadId }; task.updatedAt=current.toISOString();
-        if(task.routerId===SCHEDULE_ROUTER_ID&&!sensitiveAction){for(let i=all.length-1;i>=0;i--){const prior=all[i];if(prior.runId===task.runId&&!prior.deliveredAt&&!prior.abandonedAt&&!prior.lifecycleOnly&&!prior.sensitiveAction&&!prior.leaseUntil)all.splice(i,1);}}
-        if (input.kind === "completed" || input.kind === "failed") { task.status = input.kind; task.reportCapability = ""; task.pendingTerminalReport=report; replace(pathFor(config, "parent-tasks.jsonl"), tasks); options.afterTerminalCommitted?.(task.runId); const terminalReports=records<ParentReport>(pathFor(config,"parent-reports.jsonl")); if(task.routerId===SCHEDULE_ROUTER_ID&&!sensitiveAction){for(let i=terminalReports.length-1;i>=0;i--){const prior=terminalReports[i];if(prior.runId===task.runId&&!prior.deliveredAt&&!prior.abandonedAt&&!prior.lifecycleOnly&&!prior.sensitiveAction&&!prior.leaseUntil)terminalReports.splice(i,1);}}if(!terminalReports.some(r=>r.id===report.id)){terminalReports.push(report);replace(pathFor(config,"parent-reports.jsonl"),terminalReports);} const finalized=records<TaskRecord>(pathFor(config,"parent-tasks.jsonl")); const terminalTask=finalized.find(t=>t.runId===task.runId); if(terminalTask)delete terminalTask.pendingTerminalReport; replace(pathFor(config,"parent-tasks.jsonl"),finalized); }
+        const report: ParentReport = { id: `report_${current.getTime().toString(36)}_${randomBytes(5).toString("hex")}`, runId: task.runId, routerId: task.routerId, chatId: task.chatId, kind: input.kind, message: input.message, sensitiveAction, challengedAction, challengeToken: sensitiveAction ? randomBytes(6).toString("hex").toUpperCase() : undefined, challengeExpiresAt:sensitiveAction?new Date(current.getTime()+CHALLENGE_MS).toISOString():undefined, createdAt: current.toISOString() }; task.updatedAt=current.toISOString();
+        if (input.kind === "completed" || input.kind === "failed") { task.status = input.kind; task.reportCapability = ""; task.pendingTerminalReport=report; replace(pathFor(config, "parent-tasks.jsonl"), tasks); options.afterTerminalCommitted?.(task.runId); const terminalReports=records<ParentReport>(pathFor(config,"parent-reports.jsonl")); if(!terminalReports.some(r=>r.id===report.id)){terminalReports.push(report);replace(pathFor(config,"parent-reports.jsonl"),terminalReports);} const finalized=records<TaskRecord>(pathFor(config,"parent-tasks.jsonl")); const terminalTask=finalized.find(t=>t.runId===task.runId); if(terminalTask)delete terminalTask.pendingTerminalReport; replace(pathFor(config,"parent-tasks.jsonl"),finalized); }
         else { all.push(report); replace(pathFor(config, "parent-reports.jsonl"), all); replace(pathFor(config, "parent-tasks.jsonl"), tasks); }
         return json(res, 201, { report });
       }
@@ -381,7 +439,7 @@ export function createRuntimeServer(config: RuntimeConfig, token: string, runner
         if(delivery[2]==="ack"){const task=records<TaskRecord>(pathFor(config,"parent-tasks.jsonl")).find(t=>t.runId===report.runId);const run=loadRuns(config).find(r=>r.id===report.runId);const cleanupReady=task?.routerId!==SCHEDULE_ROUTER_ID||report.lifecycleOnly;if(cleanupReady&&task&&(task.status==="completed"||task.status==="failed")&&run&&run.ownsPane!==false){if(run.backend==="herdr")closeHerdrWorker(config,run,runner);else if(run.backend==="tmux")closeTmuxWorker(config,run,runner);}}
         reconcileAndCompact(config,current,policy,runner,probeTimes); return json(res, 200, { report });
       }
-      if (req.method === "POST" && url.pathname === "/v1/runs") { if (!general) return json(res, 401, { error: "unauthorized" }); const input = await body(req) as LaunchRequest; if (typeof input?.agent !== "string" || typeof input?.repo !== "string" || typeof input?.prompt !== "string" || (input.name !== undefined && typeof input.name !== "string") || (input.backend !== undefined && input.backend !== "tmux" && input.backend !== "herdr") || (input.workspaceId !== undefined && typeof input.workspaceId !== "string") || (input.lane !== undefined && input.lane !== "human_copilot" && input.lane !== "full_ai") || input.environment !== undefined || input.extension !== undefined) throw new Error("invalid launch request"); const id = `run_${Date.now().toString(36)}_${randomBytes(5).toString("hex")}`; const backend = input.backend ?? config.defaultBackend ?? "tmux"; const run = backend === "herdr" ? launchInHerdr(config, input, id, runner) : launchInTmux(config, input, id, runner); append(pathFor(config, "runs.jsonl"), run); return json(res, 201, run); }
+      if (req.method === "POST" && url.pathname === "/v1/runs") { if (!general) return json(res, 401, { error: "unauthorized" }); const input = await body(req) as LaunchRequest; if (typeof input?.agent !== "string" || typeof input?.repo !== "string" || typeof input?.prompt !== "string" || (input.name !== undefined && typeof input.name !== "string") || (input.backend !== undefined && input.backend !== "tmux" && input.backend !== "herdr") || (input.workspaceId !== undefined && typeof input.workspaceId !== "string") || (input.lane !== undefined && input.lane !== "human_copilot" && input.lane !== "full_ai") || input.environment !== undefined || input.extension !== undefined) throw new Error("invalid launch request"); const id = `run_${Date.now().toString(36)}_${randomBytes(5).toString("hex")}`; const backend = input.backend ?? config.defaultBackend ?? "tmux"; const run = backend === "herdr" ? launchInHerdr(config, input, id, runner) : launchInTmux(config, input, id, runner); ensureLaunchReady(config,run,runner,options); append(pathFor(config, "runs.jsonl"), run); return json(res, 201, run); }
       if (req.method === "GET" && url.pathname === "/v1/agents") { if (!general) return json(res, 401, { error: "unauthorized" }); return json(res, 200, { agents: Object.entries(config.agents).map(([name,a]) => ({ name, command: a.command[0], prompt_mode: a.promptMode ?? "arg" })) }); }
       if (req.method === "GET" && url.pathname === "/v1/runs") { if (!general) return json(res, 401, { error: "unauthorized" }); return json(res, 200, { runs: reconciledRuns(config, runner) }); }
       if (req.method === "GET" && url.pathname.startsWith("/v1/runs/")) { if (!general) return json(res, 401, { error: "unauthorized" }); const id = decodeURIComponent(url.pathname.slice("/v1/runs/".length)); const run = reconciledRuns(config, runner).find(item => item.id === id); if (!run) return json(res, 404, { error: "not found" }); return json(res, 200, run); }
@@ -389,6 +447,6 @@ export function createRuntimeServer(config: RuntimeConfig, token: string, runner
     } catch (err) { return json(res, 400, { error: err instanceof Error ? err.message : "bad request" }); }
     }).catch(err => { if (!res.headersSent) json(res, 500, { error: err instanceof Error ? err.message : "runtime request failed" }); });
   });
-  server.on("close", () => rmSync(writerLock, { recursive: true, force: true }));
+  server.on("close", () => { try{if(readFileSync(resolve(writerLock.lock,"owner"),"utf8").trim()===writerLock.owner)rmSync(writerLock.lock,{recursive:true,force:true});}catch{/* lock already gone or replaced */} });
   return server;
 }

@@ -223,6 +223,38 @@ func TestPersistentTurnsContainOnlyMessageText(t *testing.T) {
 	}
 }
 
+func TestRouterModePromptInjectsOrchestratorInstructions(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Trusted = true
+	cfg.RouterMode = true
+	responder := &fakePersistentResponder{}
+	adapter := Adapter{Config: cfg, PersistentResponder: responder}
+	if _, err := adapter.RespondMeasured(context.Background(), Message{ID: "7", Text: "status"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Orchestrator instructions", "use list_tasks", "never guess identifiers"} {
+		if !strings.Contains(responder.prompt, want) {
+			t.Fatalf("router prompt missing %q: %q", want, responder.prompt)
+		}
+	}
+}
+
+func TestRouterModeIncrementalPromptInjectsOrchestratorInstructions(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Trusted = true
+	cfg.RouterMode = true
+	responder := &fakePersistentResponder{state: PersistentResponderState{NeedsBootstrap: false}}
+	adapter := Adapter{Config: cfg, PersistentResponder: responder}
+	if _, err := adapter.RespondMeasured(context.Background(), Message{ID: "8", Text: "status"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Orchestrator instructions", "use list_tasks", "never guess identifiers"} {
+		if !strings.Contains(responder.prompt, want) {
+			t.Fatalf("incremental router prompt missing %q: %q", want, responder.prompt)
+		}
+	}
+}
+
 func TestTrustedPersistentResponderBudgetCapsExcessiveConfiguredTimeout(t *testing.T) {
 	if MaxTrustedResponderDuration != 5*time.Minute {
 		t.Fatalf("trusted responder ceiling = %v, want 5m", MaxTrustedResponderDuration)

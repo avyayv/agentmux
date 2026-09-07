@@ -21,6 +21,9 @@ export interface RuntimeConfig {
   delegateAgent?: string;
   /** Explicit, private aliases for repositories the trusted router may launch in. */
   repoAliases?: Record<string, string>;
+  /** Test/advanced override for bounded Herdr registration readiness. */
+  herdrReadinessMs?: number;
+  herdrReadinessPollMs?: number;
 }
 
 export interface RunRecord {

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,8 +26,20 @@ func TestSchedulePositionalPromptShowAndSet(t *testing.T) {
 	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	config := `{"host":"127.0.0.1","port":1,"stateDir":"` + home + `","tokenFile":"` + filepath.Join(home, "token") + `","nodePath":"/opt/homebrew/bin/node","herdrSession":"default","agents":{"pi":{"command":["pi"]}}}`
-	if err := os.WriteFile(filepath.Join(runtimeDir, "config.json"), []byte(config), 0o600); err != nil {
+	// This command validates the executable path but never launches Node.
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := json.Marshal(map[string]any{
+		"host": "127.0.0.1", "port": 1, "stateDir": home,
+		"tokenFile": filepath.Join(home, "token"), "nodePath": executable,
+		"herdrSession": "default", "agents": map[string]any{"pi": map[string]any{"command": []string{"pi"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runtimeDir, "config.json"), config, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	root := NewRootCommand(BuildInfo{})

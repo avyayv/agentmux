@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -182,7 +183,7 @@ func TestHistoryUsesScopedArgvAndFilters(t *testing.T) {
 	}
 }
 
-func TestTrustedResponderPromptEnablesOrchestration(t *testing.T) {
+func TestResponderPassesOnlyTheTurnText(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Trusted = true
 	cfg.ResponderCwd = t.TempDir()
@@ -191,67 +192,26 @@ func TestTrustedResponderPromptEnablesOrchestration(t *testing.T) {
 	if _, err := adapter.Respond(context.Background(), Message{ID: "m", Text: "launch an agent"}); err != nil {
 		t.Fatal(err)
 	}
-	if len(fake.promptBodies) != 1 || !strings.Contains(fake.promptBodies[0], "persistent coding orchestrator") {
+	if len(fake.promptBodies) != 1 || fake.promptBodies[0] != "launch an agent" {
 		t.Fatalf("trusted prompt = %#v", fake.promptBodies)
 	}
 }
 
-func TestWarmPersistentResponderUsesIncrementalPromptAndKeepsMemoryAvailable(t *testing.T) {
-	cfg := testConfig(t)
-	cfg.Trusted = true
-	memoryPath := filepath.Join(t.TempDir(), "MEMORY.md")
-	if err := os.WriteFile(memoryPath, []byte("private durable fact that must not be reinjected"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg.MemoryFile = memoryPath
-	responder := &fakePersistentResponder{}
-	adapter := Adapter{Config: cfg, PersistentResponder: responder}
-	response, err := adapter.RespondMeasured(context.Background(), Message{ID: "42", Text: "hello"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if response.Reply != "done" {
-		t.Fatalf("reply = %q", response.Reply)
-	}
-	if strings.Contains(responder.prompt, "private durable fact") {
-		t.Fatalf("warm prompt reinjected memory contents: %q", responder.prompt)
-	}
-	for _, want := range []string{memoryPath, "Incoming iMessage ID 42", "hello"} {
-		if !strings.Contains(responder.prompt, want) {
-			t.Fatalf("warm prompt missing %q: %q", want, responder.prompt)
-		}
-	}
-}
-
-func TestRouterModePromptInjectsOrchestratorInstructions(t *testing.T) {
-	cfg := testConfig(t)
-	cfg.Trusted = true
-	cfg.RouterMode = true
-	responder := &fakePersistentResponder{}
-	adapter := Adapter{Config: cfg, PersistentResponder: responder}
-	if _, err := adapter.RespondMeasured(context.Background(), Message{ID: "7", Text: "status"}); err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{"Orchestrator instructions", "use list_tasks", "never guess identifiers", "return the acknowledgment immediately", "do not wait for or inspect the worker in the same turn", "Omit the agent parameter"} {
-		if !strings.Contains(responder.prompt, want) {
-			t.Fatalf("router prompt missing %q: %q", want, responder.prompt)
-		}
-	}
-}
-
-func TestRouterModeIncrementalPromptInjectsOrchestratorInstructions(t *testing.T) {
-	cfg := testConfig(t)
-	cfg.Trusted = true
-	cfg.RouterMode = true
-	responder := &fakePersistentResponder{state: PersistentResponderState{NeedsBootstrap: false}}
-	adapter := Adapter{Config: cfg, PersistentResponder: responder}
-	if _, err := adapter.RespondMeasured(context.Background(), Message{ID: "8", Text: "status"}); err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{"Orchestrator instructions", "use list_tasks", "never guess identifiers", "return the acknowledgment immediately", "do not wait for or inspect the worker in the same turn", "Omit the agent parameter"} {
-		if !strings.Contains(responder.prompt, want) {
-			t.Fatalf("incremental router prompt missing %q: %q", want, responder.prompt)
-		}
+func TestPersistentTurnsContainOnlyMessageText(t *testing.T) {
+	for _, cold := range []bool{false, true} {
+		t.Run(fmt.Sprint(cold), func(t *testing.T) {
+			cfg := testConfig(t)
+			cfg.Trusted = true
+			cfg.RouterMode = true
+			responder := &fakePersistentResponder{state: PersistentResponderState{NeedsBootstrap: cold}}
+			adapter := Adapter{Config: cfg, PersistentResponder: responder}
+			if _, err := adapter.RespondMeasured(context.Background(), Message{ID: "42", Text: "hello"}); err != nil {
+				t.Fatal(err)
+			}
+			if responder.prompt != "hello" {
+				t.Fatalf("prompt=%q", responder.prompt)
+			}
+		})
 	}
 }
 
@@ -271,7 +231,7 @@ func TestTrustedPersistentResponderBudgetCapsExcessiveConfiguredTimeout(t *testi
 	}
 }
 
-func TestEmptyPersistentSessionReceivesFullBootstrapContext(t *testing.T) {
+func TestEmptyPersistentSessionDoesNotInjectMemoryIntoTurn(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Trusted = true
 	memoryPath := filepath.Join(t.TempDir(), "MEMORY.md")
@@ -284,8 +244,8 @@ func TestEmptyPersistentSessionReceivesFullBootstrapContext(t *testing.T) {
 	if _, err := adapter.RespondMeasured(context.Background(), Message{ID: "42", Text: "hello"}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(responder.prompt, "durable bootstrap fact") {
-		t.Fatalf("bootstrap prompt did not include memory: %q", responder.prompt)
+	if responder.prompt != "hello" {
+		t.Fatalf("bootstrap turn = %q", responder.prompt)
 	}
 }
 

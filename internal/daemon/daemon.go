@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -583,7 +584,7 @@ func (r *Runner) PollMessages(ctx context.Context) {
 				latency.QueueMS = claimTime.Sub(*createdAt).Milliseconds()
 			}
 			st.SeenMessageIDs[message.ID] = claimTime.Format(time.RFC3339Nano)
-			st.MessageJobs[message.ID] = orchestrator.MessageJob{MessageID: message.ID, Status: "queued", ClaimedAt: claimTime, UpdatedAt: claimTime, Latency: latency}
+			st.MessageJobs[message.ID] = orchestrator.MessageJob{Input: &orchestrator.MessageInput{Text: message.Text, ChatID: message.ChatID, CreatedAt: message.CreatedAt}, MessageID: message.ID, Status: "queued", ClaimedAt: claimTime, UpdatedAt: claimTime, Latency: latency}
 			claimedMessages = append(claimedMessages, message)
 		}
 		return nil
@@ -617,6 +618,18 @@ func (r *Runner) PollMessages(ctx context.Context) {
 // ReceiveMessages prefers imsg's long-lived watch stream. Old imsg binaries
 // that do not expose watch retain the history polling path.
 func (r *Runner) ReceiveMessages(ctx context.Context) {
+	for {
+		if err := r.recoverMessages(ctx); err == nil {
+			break
+		} else {
+			log.Printf("Context Drop iMessage recovery failed: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
 	err := r.WatchMessages(ctx)
 	if ctx.Err() != nil {
 		return
@@ -798,7 +811,7 @@ func (r *Runner) claimWatchedMessage(ctx context.Context, message imessage.Messa
 			latency.QueueMS = claimTime.Sub(*createdAt).Milliseconds()
 		}
 		st.SeenMessageIDs[incoming.ID] = claimTime.Format(time.RFC3339Nano)
-		st.MessageJobs[incoming.ID] = orchestrator.MessageJob{MessageID: incoming.ID, Status: "queued", ClaimedAt: claimTime, UpdatedAt: claimTime, Latency: latency}
+		st.MessageJobs[incoming.ID] = orchestrator.MessageJob{Input: &orchestrator.MessageInput{Text: incoming.Text, ChatID: incoming.ChatID, CreatedAt: incoming.CreatedAt}, MessageID: incoming.ID, Status: "queued", ClaimedAt: claimTime, UpdatedAt: claimTime, Latency: latency}
 		claimed = true
 		return nil
 	}); err != nil {
@@ -865,6 +878,43 @@ func (r *Runner) startMessageWorker(ctx context.Context) {
 	})
 }
 
+// Only queued work is safe to replay. A processing turn may already have
+// executed tools or sent a reply, so preserve it for explicit reconciliation.
+func (r *Runner) recoverMessages(ctx context.Context) error {
+	var queued []orchestrator.MessageJob
+	if err := r.Store.Update(func(st *orchestrator.State) error {
+		if r.IMessage == nil || st.IMessageChatID != r.IMessage.Config.ChatID {
+			return nil
+		}
+		for id, job := range st.MessageJobs {
+			if job.Status == "processing" || (job.Status == "queued" && job.Input == nil) {
+				job.Status = "unknown"
+				job.Error = "interrupted request; inspect outcome before retrying"
+				job.UpdatedAt = r.Now()
+				st.MessageJobs[id] = job
+			} else if job.Status == "queued" {
+				queued = append(queued, job)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	sort.Slice(queued, func(i, j int) bool {
+		if queued[i].ClaimedAt.Equal(queued[j].ClaimedAt) {
+			return queued[i].MessageID < queued[j].MessageID
+		}
+		return queued[i].ClaimedAt.Before(queued[j].ClaimedAt)
+	})
+	for _, job := range queued {
+		input := job.Input
+		if _, err := r.enqueueMessages(ctx, []imessage.Message{{ID: job.MessageID, Text: input.Text, ChatID: input.ChatID, CreatedAt: input.CreatedAt}}, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func responderFailureReply(err error, response imessage.Response) string {
 	if response.SideEffectToolCompleted {
 		return "the responder didn’t produce a final reply, but delegated or continued work may already have started. i won’t repeat the request; check current task status before deciding next steps."
@@ -892,6 +942,7 @@ func (r *Runner) processMessage(ctx context.Context, message imessage.Message) {
 		return nil
 	}); err != nil {
 		log.Printf("Context Drop iMessage processing state failed: %v", err)
+		return // Never execute tools unless the processing transition is durable.
 	}
 	var response imessage.Response
 	var responderErr error
@@ -927,6 +978,7 @@ func (r *Runner) processMessage(ctx context.Context, message imessage.Message) {
 	if err := r.Store.Update(func(st *orchestrator.State) error {
 		job := st.MessageJobs[message.ID]
 		job.Status = status
+		job.Input = nil
 		job.UpdatedAt = completedAt
 		job.Error = errorText
 		if status == "sent" {

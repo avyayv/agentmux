@@ -192,15 +192,38 @@ function acquireWriterLock(config: RuntimeConfig): string {
   const lock = pathFor(config, "writer.lock");
   const recordOwner = () => writeFileSync(resolve(lock, "pid"), String(process.pid) + "\n", { mode: 0o600 });
   if (!existsSync(lock)) {
-    try { mkdirSync(lock, { mode: 0o700 }); recordOwner(); return lock; } catch { /* raced: fall through to ownership check */ }
+    try { mkdirSync(lock, { mode: 0o700 }); } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      return acquireExistingWriterLock();
+    }
+    recordOwner();
+    return lock;
   }
-  let owner = 0;
-  try { owner = parseInt(readFileSync(resolve(lock, "pid"), "utf8"), 10); } catch { /* unknown owner */ }
-  if (owner > 0) { let alive = true; try { process.kill(owner, 0); } catch (err) { alive = (err as NodeJS.ErrnoException).code === "EPERM"; } if (alive) throw new Error("runtime state is already owned by another writer"); }
-  if (owner <= 0 && Date.now() - statSync(lock).mtimeMs < 30_000) throw new Error("runtime state is already owned by another writer");
-  rmSync(lock, { recursive: true, force: true });
-  try { mkdirSync(lock, { mode: 0o700 }); recordOwner(); } catch { throw new Error("runtime state is already owned by another writer"); }
-  return lock;
+  return acquireExistingWriterLock();
+
+  function acquireExistingWriterLock(): string {
+    let owner = 0;
+    try { owner = parseInt(readFileSync(resolve(lock, "pid"), "utf8"), 10); } catch { /* unknown owner */ }
+    if (owner > 0) {
+      let alive = true;
+      try { process.kill(owner, 0); } catch (err) { alive = (err as NodeJS.ErrnoException).code === "EPERM"; }
+      if (alive) throw new Error("runtime state is already owned by another writer");
+    }
+    // If the directory vanished, retry acquisition rather than masking ENOENT.
+    let modified: number;
+    try { modified = statSync(lock).mtimeMs; } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return acquireWriterLock(config);
+      throw err;
+    }
+    if (owner <= 0 && Date.now() - modified < 30_000) throw new Error("runtime state is already owned by another writer");
+    rmSync(lock, { recursive: true, force: true });
+    try { mkdirSync(lock, { mode: 0o700 }); } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new Error("runtime state is already owned by another writer");
+      throw err;
+    }
+    recordOwner();
+    return lock;
+  }
 }
 
 export function createRuntimeServer(config: RuntimeConfig, token: string, runner: CommandRunner = systemRunner, options: RuntimeServerOptions = {}) {
@@ -213,6 +236,12 @@ export function createRuntimeServer(config: RuntimeConfig, token: string, runner
   reconcileAndCompact(config,now(),policy,runner,probeTimes);
   let requestQueue: Promise<void> = Promise.resolve();
   const server = createServer((req, res) => {
+    // Liveness must not rewrite state or wait behind a request body/worker launch.
+    // Synchronous work can still block the event loop; this is not readiness.
+    if (req.method === "GET" && req.url === "/health") {
+      if (!capMatches(auth(req), token)) return json(res, 401, { error: "unauthorized" });
+      return json(res, 200, { ok: true });
+    }
     requestQueue = requestQueue.then(async () => {
     try {
       const current=now(); reconcileAndCompact(config,current,policy,runner,probeTimes);
@@ -300,7 +329,10 @@ export function createRuntimeServer(config: RuntimeConfig, token: string, runner
         return json(res, 201, { report });
       }
       if (req.method === "POST" && url.pathname === "/v1/reports/lease") {
-        if (!general) return json(res, 401, { error: "unauthorized" }); const owner = ownerInput(await body(req)); try { observeManagedLiveTasks(config, current, runner); } catch { /* pending reports remain deliverable when live backend inspection fails */ } const all = records<ParentReport>(pathFor(config, "parent-reports.jsonl")); const report = all.find(r => r.routerId === owner.routerId && r.chatId === owner.chatId && !r.deliveredAt && (!r.leaseUntil || Date.parse(r.leaseUntil) <= current.getTime())); if (!report) return json(res, 200, {}); report.leaseId = randomBytes(16).toString("base64url"); report.leaseUntil = new Date(current.getTime() + LEASE_MS).toISOString(); replace(pathFor(config, "parent-reports.jsonl"), all); return json(res, 200, { report });
+        if (!general) return json(res, 401, { error: "unauthorized" }); const input = await body(req); const owner = ownerInput(input);
+        const leaseSeconds = input.leaseSeconds ?? LEASE_MS / 1000;
+        if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1 || leaseSeconds > 3600) throw new Error("leaseSeconds must be an integer in 1..3600");
+        try { observeManagedLiveTasks(config, current, runner); } catch { /* pending reports remain deliverable when live backend inspection fails */ } const all = records<ParentReport>(pathFor(config, "parent-reports.jsonl")); const report = all.find(r => r.routerId === owner.routerId && r.chatId === owner.chatId && !r.deliveredAt && (!r.leaseUntil || Date.parse(r.leaseUntil) <= current.getTime())); if (!report) return json(res, 200, {}); report.leaseId = randomBytes(16).toString("base64url"); report.leaseUntil = new Date(current.getTime() + leaseSeconds * 1000).toISOString(); replace(pathFor(config, "parent-reports.jsonl"), all); return json(res, 200, { report });
       }
       const delivery = url.pathname.match(/^\/v1\/reports\/([^/]+)\/(ack|release)$/); if (req.method === "POST" && delivery) {
         if (!general) return json(res, 401, { error: "unauthorized" }); const input = await body(req); const owner = ownerInput(input); const all = records<ParentReport>(pathFor(config, "parent-reports.jsonl")); const report = all.find(r => r.id === decodeURIComponent(delivery[1]) && r.routerId === owner.routerId && r.chatId === owner.chatId); if (!report || !capMatches(input.leaseId ?? "", report.leaseId ?? "")) return json(res, 409, { error: "invalid report lease" }); if (delivery[2] === "ack") report.deliveredAt = now().toISOString(); delete report.leaseId; delete report.leaseUntil; replace(pathFor(config, "parent-reports.jsonl"), all);

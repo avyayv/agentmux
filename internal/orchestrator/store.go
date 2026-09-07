@@ -75,7 +75,14 @@ type Job struct {
 	FinishedAt    *time.Time `json:"finished_at,omitempty"`
 }
 
+type MessageInput struct {
+	Text      string `json:"text"`
+	ChatID    string `json:"chat_id"`
+	CreatedAt string `json:"created_at"`
+}
+
 type MessageJob struct {
+	Input               *MessageInput  `json:"input,omitempty"`
 	MessageID           string         `json:"message_id"`
 	Status              string         `json:"status"`
 	ClaimedAt           time.Time      `json:"claimed_at"`
@@ -306,12 +313,17 @@ func pruneState(st *State) {
 			at time.Time
 		}
 		items := make([]item, 0, len(st.MessageJobs))
+		keep := make(map[string]MessageJob)
 		for id, job := range st.MessageJobs {
+			if job.Status == "queued" || job.Status == "processing" || job.Status == "unknown" {
+				keep[id] = job
+				continue
+			}
 			items = append(items, item{id, job.UpdatedAt})
 		}
 		sort.Slice(items, func(i, j int) bool { return items[i].at.After(items[j].at) })
-		keep := make(map[string]MessageJob, MaxMessageJobs)
-		for _, item := range items[:MaxMessageJobs] {
+		limit := max(0, MaxMessageJobs-len(keep))
+		for _, item := range items[:min(len(items), limit)] {
 			keep[item.id] = st.MessageJobs[item.id]
 		}
 		st.MessageJobs = keep

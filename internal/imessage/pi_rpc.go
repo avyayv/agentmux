@@ -115,6 +115,16 @@ func NewPiRPCResponder(cfg Config) (*PiRPCResponder, bool, error) {
 	routerExtensionPath := ""
 	if cfg.RouterMode {
 		argv = restrictedRouterArgv(argv)
+		if cfg.PersonaFile != "" {
+			basePrompt, err := os.ReadFile(cfg.PersonaFile)
+			if err != nil {
+				return nil, false, fmt.Errorf("read orchestrator base prompt: %w", err)
+			}
+			if len(basePrompt) == 0 || len(basePrompt) > DefaultMaxPersonaBytes {
+				return nil, false, fmt.Errorf("orchestrator base prompt must contain 1-%d bytes", DefaultMaxPersonaBytes)
+			}
+			argv = append(argv, "--system-prompt", string(basePrompt))
+		}
 		routerExtensionPath = filepath.Join(dir, "pi-router-extension.mjs")
 		argv = append(argv, "--no-builtin-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--extension", routerExtensionPath)
 	}

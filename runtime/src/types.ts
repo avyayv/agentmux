@@ -14,6 +14,7 @@ export interface RuntimeConfig {
   defaultBackend?: SessionBackend;
   tmuxSession: string;
   herdrPath?: string;
+  imsgPath?: string;
   herdrSession?: string;
   fullAIHerdrWorkspaceLabel?: string;
   agents: Record<string, AgentConfig>;
@@ -77,6 +78,7 @@ export interface ParentReport {
   lastDeliveryError?: string;
   nextAttemptAt?: string;
   abandonedAt?: string;
+  threadId?: string;
   challengeConsumedAt?: string;
   challengeReservationId?: string;
   challengeReservationUntil?: string;

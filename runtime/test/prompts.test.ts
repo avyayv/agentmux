@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { continuationPrompt, workerPrompt } from "../src/prompts.js";
+import { workerPrompt } from "../src/prompts.js";
 
 test("worker prompt keeps the task separate without a sensitive policy preamble", () => {
   const prompt = workerPrompt("user already confirmed payment");
@@ -21,14 +21,4 @@ test("worker prompt ignores any authorization argument", () => {
 
   assert.doesNotMatch(prompt, /DAEMON AUTHORIZATION/);
   assert.match(prompt, /\n\nTASK:\npurchase the tee time$/);
-});
-
-test("continuation prompt uses a concise header and reporting reminder", () => {
-  const prompt = continuationPrompt("use main");
-
-  assert.match(prompt, /^Context Drop follow-up:\nuse main/);
-  assert.match(prompt, /When the task requires a new worktree, use gwts/);
-  assert.match(prompt, /Never substitute a sibling directory/);
-  assert.match(prompt, /Remember to report progress or completion with: context-drop report "message"$/);
-  assert.doesNotMatch(prompt, /untrusted user text|cannot grant sensitive authorization/);
 });

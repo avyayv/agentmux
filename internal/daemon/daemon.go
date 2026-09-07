@@ -63,6 +63,9 @@ type RuntimeLauncher interface {
 type DelegationRuntime interface {
 	Health(context.Context) error
 	IssueRouterCapability(context.Context, string, string) (string, error)
+	Delegate(context.Context, string, string, string) (runtimeclient.ManagedTask, error)
+	ActiveTask(context.Context, string) (runtimeclient.ManagedTask, bool, error)
+	ContinueTask(context.Context, string, string, string) (runtimeclient.ManagedTask, error)
 	LeaseReport(context.Context, string, string) (runtimeclient.ParentReport, bool, error)
 	FinishReport(context.Context, runtimeclient.ParentReport, string, string, bool) error
 	AutoAuthorize(context.Context, runtimeclient.ParentReport, string, string) (runtimeclient.Run, string, error)
@@ -81,6 +84,8 @@ type Runner struct {
 	MessageWatchRetryMax     time.Duration
 	MessageWatchFailureLimit int
 	mu                       sync.Mutex
+	routerMu                 sync.RWMutex
+	routerCapability         string
 	messagePollMu            sync.Mutex
 	messageWorkerOnce        sync.Once
 	messageQueue             chan messageBatch
@@ -983,6 +988,23 @@ func (r *Runner) processMessage(ctx context.Context, message imessage.Message) {
 		message.RecentOutbound = make([]imessage.ContextMessage, 0, len(state.RecentOutbound))
 		for _, outbound := range state.RecentOutbound {
 			message.RecentOutbound = append(message.RecentOutbound, imessage.ContextMessage{Text: outbound.Text, CreatedAt: outbound.SentAt.Format(time.RFC3339), Source: outbound.Source})
+
+		}
+	}
+	if registrar, ok := r.Delegation.(interface {
+		RegisterIMessageThread(context.Context, string, string, map[string]string) (string, error)
+	}); ok && message.GUID != "" {
+		threadID, err := registrar.RegisterIMessageThread(ctx, imessageRouterID, r.IMessage.Config.ChatID, map[string]string{
+			"messageGuid":    message.GUID,
+			"threadRootGuid": message.ThreadRootGUID,
+			"chatGuid":       message.ChatGUID,
+			"preview":        message.Text,
+			"createdAt":      message.CreatedAt,
+		})
+		if err != nil {
+			log.Printf("Context Drop iMessage thread registration failed: %v", err)
+		} else {
+			message.ThreadID = threadID
 		}
 	}
 	processingStarted := r.Now()
@@ -1005,6 +1027,8 @@ func (r *Runner) processMessage(ctx context.Context, message imessage.Message) {
 	if r.IMessage.Config.RouterMode {
 		if confirmationReply, handled := r.confirmSensitiveAction(ctx, message.ChatID, message.Text); handled {
 			response.Reply = confirmationReply
+		} else if r.IMessage.Config.DelegateAll {
+			response.Reply, responderErr = r.delegateMessage(ctx, message)
 		} else {
 			response, responderErr = r.IMessage.RespondMeasured(ctx, message)
 		}
@@ -1012,8 +1036,11 @@ func (r *Runner) processMessage(ctx context.Context, message imessage.Message) {
 		response, responderErr = r.IMessage.RespondMeasured(ctx, message)
 	}
 	processErr := responderErr
+	if response.MessagingSideEffectToolCompleted {
+		processErr = nil
+	}
 	var sendDuration time.Duration
-	if processErr == nil {
+	if processErr == nil && !response.ThreadReplyToolCompleted && response.Reply != "" {
 		sendStarted := time.Now()
 		processErr = r.IMessage.Send(ctx, response.Reply)
 		sendDuration = time.Since(sendStarted)
@@ -1027,7 +1054,7 @@ func (r *Runner) processMessage(ctx context.Context, message imessage.Message) {
 		log.Printf("Context Drop iMessage message %s failed: %v", message.ID, processErr)
 		// Only send a generic error when the responder failed. If `imsg send`
 		// failed after possibly delivering, never send a second reply.
-		if responderErr != nil {
+		if responderErr != nil && !response.MessagingSideEffectToolCompleted {
 			_ = r.IMessage.Send(ctx, responderFailureReply(responderErr, response))
 		}
 	}

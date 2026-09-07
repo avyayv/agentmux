@@ -30,7 +30,7 @@ export default function (pi) {
   pi.registerTool({
     name: "delegate_task", label: "Delegate task",
     description: "Start ordinary work in a fully managed full-AI worker. The optional agent must be configured; keep the private name short and recognizable.",
-    parameters: Type.Object({ agent: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })), prompt: Type.String({ minLength: 1, maxLength: 16000 }), name: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })) }),
+    parameters: Type.Object({ agent: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })), prompt: Type.String({ minLength: 1, maxLength: 16000 }), name: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })), threadId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })) }),
     async execute(_id, input, signal) { const result = await request("/v1/tasks/delegate", "POST", input, signal); return { content: [{ type: "text", text: `task started in pane ${result.task.paneId}` }], details: result }; },
   });
   pi.registerTool({
@@ -64,6 +64,24 @@ export default function (pi) {
     async execute(_id, input, signal) { const result = await pollHerdrStatus(input,signal); return { content: [{ type: "text", text: JSON.stringify(result) }], details: result }; },
   });
   pi.registerTool({
+    name: "list_active_threads", label: "List active iMessage threads",
+    description: "List opaque active thread IDs in the configured private chat. Use this before replying or reacting to any thread other than the current one.",
+    parameters: Type.Object({}),
+    async execute(_id, _input, signal) { const result = await request("/v1/imessage/threads", "GET", undefined, signal); return { content: [{ type: "text", text: JSON.stringify(result) }], details: result }; },
+  });
+  pi.registerTool({
+    name: "reply_to_thread", label: "Reply in iMessage thread",
+    description: "Send text as a reply in an exact active iMessage thread. After sending the user-facing response with this tool, return exactly CONTEXT_DROP_NO_USER_REPLY_V1 to prevent a duplicate unthreaded message.",
+    parameters: Type.Object({ threadId: Type.String({ minLength: 1, maxLength: 128 }), text: Type.String({ minLength: 1, maxLength: 16000 }) }),
+    async execute(_id, input, signal) { const result = await request("/v1/imessage/threads/reply", "POST", input, signal); return { content: [{ type: "text", text: "thread reply sent" }], details: result }; },
+  });
+  pi.registerTool({
+    name: "react_to_thread", label: "React in iMessage thread",
+    description: "Add a targeted Tapback to the latest inbound message associated with an exact active thread. This requires the advanced imsg bridge.",
+    parameters: Type.Object({ threadId: Type.String({ minLength: 1, maxLength: 128 }), reaction: Type.Union([Type.Literal("love"), Type.Literal("like"), Type.Literal("dislike"), Type.Literal("laugh"), Type.Literal("emphasis"), Type.Literal("question")]) }),
+    async execute(_id, input, signal) { const result = await request("/v1/imessage/threads/react", "POST", input, signal); return { content: [{ type: "text", text: "thread reaction sent" }], details: result }; },
+  });
+  pi.registerTool({
     name: "repo_list", label: "List repositories",
     description: "List private validated repository aliases available for launching. Only aliases are returned; do not guess missing aliases.",
     parameters: Type.Object({}),
@@ -76,6 +94,6 @@ export default function (pi) {
     async execute(_id, input, signal) { const result = await request("/v1/tasks/start", "POST", input, signal); return { content: [{ type: "text", text: `agent started in pane ${result.task.paneId}` }], details: result }; },
   });
   pi.on("before_agent_start", () => {
-    pi.setActiveTools(["list_tasks", "delegate_task", "continue_task", "herdr_overview", "herdr_read", "herdr_prompt", "herdr_wait", "repo_list", "start_agent"]);
+    pi.setActiveTools(["list_tasks", "delegate_task", "continue_task", "herdr_overview", "herdr_read", "herdr_prompt", "herdr_wait", "list_active_threads", "reply_to_thread", "react_to_thread", "repo_list", "start_agent"]);
   });
 }

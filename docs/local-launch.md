@@ -18,10 +18,12 @@ On macOS the installer uses a per-user LaunchAgent. On Linux it uses a systemd u
 The trusted conversation orchestrator exposes managed task controls and full read-only Herdr inspection:
 
 - `list_tasks`: query every worker in the selected live backend and return public pane IDs, agent, optional name, status, selection state, and whether Context Drop fully manages the task.
-- `delegate_task`: start a fully managed task using configured defaults and an optional configured agent/name.
-- `continue_task` / `herdr_prompt`: send a follow-up through the same managed continuation boundary to an exact live pane. An authorized-sensitive worker cannot be continued.
+- `delegate_task`: start a fully managed task using configured defaults and an optional configured agent/name; for iMessage work it can retain an opaque active `threadId` so reports return to the originating thread.
+- `continue_task` / `herdr_prompt`: send the message unchanged through the managed continuation boundary to an exact live pane. Context Drop does not add a header, footer, reminder, or other prompt formatting. An authorized-sensitive worker cannot be continued.
 - `herdr_overview` / `herdr_read`: inspect the full configured Herdr session without exposing raw credentials.
 - `herdr_wait`: poll authoritative status client-side with a bounded timeout and cancellation; it never invokes a blocking Herdr wait subprocess and reports timeout separately from observed status.
+- `list_active_threads`: list recent opaque iMessage thread IDs scoped to the configured router conversation; raw chat and message GUIDs are never returned.
+- `reply_to_thread` / `react_to_thread`: send a targeted reply or Tapback through the operator-managed advanced `imsg` bridge. They fail closed if the bridge is unavailable and never fall back to an untargeted message.
 - `repo_list` / `start_agent`: select only a validated alias or unambiguous live workspace cwd, then launch a fully managed, tracked worker with reporting, safety policy, and capacity enforcement.
 
 Manage aliases without editing runtime JSON:

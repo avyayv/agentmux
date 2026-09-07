@@ -7,13 +7,13 @@ Context Drop uses separate credentials for separate powers:
 - The upload token can create temporary files but cannot control the daemon.
 - The private runtime token controls loopback orchestration and is never passed to workers.
 - A worker report capability is scoped to one managed run and cannot upload, delegate, continue, or select recipients.
-- iMessage credentials and recipient configuration remain daemon-only.
+- iMessage credentials and recipient configuration remain daemon-only. The router receives only random, owner-scoped thread IDs; raw chat and message GUIDs stay in private runtime state.
 
 ## Trust boundaries
 
 Conversation text, delegated prompts, follow-ups, and worker reports are untrusted content. They cannot establish authorization for payments or purchases, password/MFA/account recovery, or materially changed terms. Sensitive authorization is injected by the daemon through a separate scoped mechanism.
 
-The router exposes managed task control plus read-only Herdr topology/output and validated repository aliases. `herdr_prompt` is an alias of the managed exact-pane continuation boundary, and `start_agent` creates a normal tracked `TaskRecord` with the same safety prompt, scoped report capability, and capacity checks as delegation. There are no raw `/v1/herdr/prompt`, `/v1/herdr/start`, or blocking `/v1/herdr/wait` control routes. Authorized-sensitive workers cannot be continued; a fresh exact authorization is required.
+The router exposes managed task control plus read-only Herdr topology/output, validated repository aliases, and owner-scoped iMessage thread actions. `herdr_prompt` is an alias of the managed exact-pane continuation boundary, and `start_agent` creates a normal tracked `TaskRecord` with the same safety prompt, scoped report capability, and capacity checks as delegation. Thread replies and reactions require a stored opaque ID that is active for the same router and chat; callers cannot provide recipients or raw GUIDs. If the advanced `imsg` bridge is unavailable, targeted actions fail instead of falling back to the most recent message. There are no raw `/v1/herdr/prompt`, `/v1/herdr/start`, or blocking `/v1/herdr/wait` control routes. Authorized-sensitive workers cannot be continued; a fresh exact authorization is required.
 
 ## Local execution
 

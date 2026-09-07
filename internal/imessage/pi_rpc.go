@@ -473,6 +473,8 @@ func (r *PiRPCResponder) Respond(ctx context.Context, prompt string, maxOutput i
 	toolNames := map[string]string{}
 	toolCompleted := false
 	sideEffectCompleted := false
+	messagingSideEffectCompleted := false
+	threadReplyCompleted := false
 	var toolDuration time.Duration
 	var compactionStarted time.Time
 	var compactionDuration time.Duration
@@ -488,7 +490,7 @@ func (r *PiRPCResponder) Respond(ctx context.Context, prompt string, maxOutput i
 				r.stopLocked()
 				cause = fmt.Errorf("Pi RPC responder: %w", err)
 			}
-			return Response{ToolCompleted: toolCompleted, SideEffectToolCompleted: sideEffectCompleted}, &ResponderTurnError{Cause: cause, ToolCompleted: toolCompleted, SideEffectToolCompleted: sideEffectCompleted}
+			return Response{ToolCompleted: toolCompleted, SideEffectToolCompleted: sideEffectCompleted, MessagingSideEffectToolCompleted: messagingSideEffectCompleted, ThreadReplyToolCompleted: threadReplyCompleted}, &ResponderTurnError{Cause: cause, ToolCompleted: toolCompleted, SideEffectToolCompleted: sideEffectCompleted}
 		}
 		switch record.Type {
 		case "response":
@@ -528,8 +530,14 @@ func (r *PiRPCResponder) Respond(ctx context.Context, prompt string, maxOutput i
 				name := toolNames[record.ToolCallID]
 				if !record.IsError {
 					toolCompleted = true
-					if name == "delegate_task" || name == "start_agent" || name == "continue_task" || name == "herdr_prompt" {
+					if name == "delegate_task" || name == "start_agent" || name == "continue_task" || name == "herdr_prompt" || name == "reply_to_thread" || name == "react_to_thread" {
 						sideEffectCompleted = true
+					}
+					if name == "reply_to_thread" || name == "react_to_thread" {
+						messagingSideEffectCompleted = true
+					}
+					if name == "reply_to_thread" {
+						threadReplyCompleted = true
 					}
 				}
 				delete(toolNames, record.ToolCallID)
@@ -547,13 +555,13 @@ func (r *PiRPCResponder) Respond(ctx context.Context, prompt string, maxOutput i
 			}
 			reply = strings.TrimSpace(reply)
 			if reply == "" {
-				return Response{ToolCompleted: toolCompleted, SideEffectToolCompleted: sideEffectCompleted}, &ResponderTurnError{Cause: errors.New("Pi RPC responder returned an empty reply"), ToolCompleted: toolCompleted, SideEffectToolCompleted: sideEffectCompleted}
+				return Response{ToolCompleted: toolCompleted, SideEffectToolCompleted: sideEffectCompleted, MessagingSideEffectToolCompleted: messagingSideEffectCompleted, ThreadReplyToolCompleted: threadReplyCompleted}, &ResponderTurnError{Cause: errors.New("Pi RPC responder returned an empty reply"), ToolCompleted: toolCompleted, SideEffectToolCompleted: sideEffectCompleted}
 			}
 			if len(reply) > maxOutput {
-				return Response{}, fmt.Errorf("Pi RPC responder reply exceeds %d bytes", maxOutput)
+				return Response{ToolCompleted: toolCompleted, SideEffectToolCompleted: sideEffectCompleted, MessagingSideEffectToolCompleted: messagingSideEffectCompleted, ThreadReplyToolCompleted: threadReplyCompleted}, fmt.Errorf("Pi RPC responder reply exceeds %d bytes", maxOutput)
 			}
 			r.needsBootstrap = false
-			return Response{Reply: reply, ToolCompleted: toolCompleted, SideEffectToolCompleted: sideEffectCompleted, Metrics: ResponseMetrics{Responder: time.Since(started), TimeToFirstOutput: firstOutput, ToolExecution: toolDuration, Compaction: compactionDuration, ModelRounds: modelRounds}}, nil
+			return Response{Reply: reply, ToolCompleted: toolCompleted, SideEffectToolCompleted: sideEffectCompleted, MessagingSideEffectToolCompleted: messagingSideEffectCompleted, ThreadReplyToolCompleted: threadReplyCompleted, Metrics: ResponseMetrics{Responder: time.Since(started), TimeToFirstOutput: firstOutput, ToolExecution: toolDuration, Compaction: compactionDuration, ModelRounds: modelRounds}}, nil
 		}
 	}
 }

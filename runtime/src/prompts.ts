@@ -19,7 +19,3 @@ export function workerPrompt(task: string, _authorization?: WorkerAuthorization)
 export function scheduledWorkerPrompt(task: string): string {
   return `${SCHEDULED_WORKER_INTRO}\n\nTASK:\n${task}`;
 }
-
-export function continuationPrompt(message: string): string {
-  return `Context Drop follow-up:\n${message}\n\n${WORKTREE_POLICY}\n\nRemember to report progress or completion with: context-drop report "message"`;
-}

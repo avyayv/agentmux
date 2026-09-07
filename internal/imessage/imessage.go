@@ -27,7 +27,7 @@ const (
 	DefaultSyncLimit                   = 20
 	DefaultHistoryTimeoutSeconds       = 30
 	DefaultResponderTimeoutSeconds     = 180
-	MaxTrustedResponderDuration        = 20 * time.Minute
+	MaxTrustedResponderDuration        = 5 * time.Minute
 	DefaultSendTimeoutSeconds          = 60
 	DefaultMaxMessageBytes             = 64 * 1024
 	DefaultMaxReplyBytes               = 8 * 1024
@@ -39,6 +39,7 @@ type Config struct {
 	Enabled                 bool     `json:"enabled"`
 	Trusted                 bool     `json:"trusted,omitempty"`
 	RouterMode              bool     `json:"router_mode,omitempty"`
+	DelegateAll             bool     `json:"delegate_all,omitempty"`
 	YoloMode                bool     `json:"yolo_mode,omitempty"`
 	ChatID                  string   `json:"chat_id"`
 	Recipient               string   `json:"recipient,omitempty"`
@@ -60,9 +61,13 @@ type Config struct {
 
 type Message struct {
 	ID             string
+	GUID           string
+	ThreadRootGUID string
+	ThreadID       string
 	Text           string
 	CreatedAt      string
 	ChatID         string
+	ChatGUID       string
 	FromMe         bool
 	RecentOutbound []ContextMessage
 }
@@ -98,10 +103,12 @@ type ModelRoundMetrics struct {
 }
 
 type Response struct {
-	Reply                   string
-	Metrics                 ResponseMetrics
-	SideEffectToolCompleted bool
-	ToolCompleted           bool
+	Reply                            string
+	Metrics                          ResponseMetrics
+	SideEffectToolCompleted          bool
+	MessagingSideEffectToolCompleted bool
+	ThreadReplyToolCompleted         bool
+	ToolCompleted                    bool
 }
 
 type PersistentResponder interface {
@@ -299,6 +306,9 @@ func (cfg Config) PollInterval() time.Duration {
 func Validate(cfg Config) error {
 	if cfg.RouterMode && !cfg.Trusted {
 		return fmt.Errorf("router mode requires a trusted private chat")
+	}
+	if cfg.DelegateAll && !cfg.RouterMode {
+		return fmt.Errorf("delegate-all mode requires router mode")
 	}
 	if cfg.YoloMode && !cfg.RouterMode {
 		return fmt.Errorf("yolo mode requires router mode")
@@ -562,25 +572,36 @@ func recentOutboundPrompt(messages []ContextMessage) string {
 	return b.String()
 }
 
+func incomingMessagePrompt(message Message) string {
+	prompt := "\nIncoming iMessage ID " + message.ID + ":"
+	if message.ThreadID != "" {
+		prompt += "\nActive iMessage thread ID: " + message.ThreadID + ". Send user-facing responses to this message with reply_to_thread, and pass this threadId to delegate_task when starting related background work. You may use react_to_thread when a reaction is appropriate. After sending the user-facing response with a thread tool, return exactly CONTEXT_DROP_NO_USER_REPLY_V1 so it is not also sent as a separate message."
+	}
+	return prompt + "\n\nThe incoming text:\n\n" + message.Text + "\n"
+}
+
 // RespondToWorkerReport delivers an untrusted worker report as a normal turn to
 // the persistent orchestrator. Unlike the former summary path, this keeps the
 // orchestrator tools available so it can decide whether to reply,
 // delegate follow-up work, continue a pane, ask the user, or take no action.
 func (a Adapter) RespondToWorkerReport(ctx context.Context, prompt string, maxOutput int) (string, error) {
+	response, err := a.RespondToWorkerReportMeasured(ctx, prompt, maxOutput)
+	return response.Reply, err
+}
+
+func (a Adapter) RespondToWorkerReportMeasured(ctx context.Context, prompt string, maxOutput int) (Response, error) {
 	if !a.Config.RouterMode || a.PersistentResponder == nil {
-		return "", fmt.Errorf("worker report delivery requires the persistent orchestrator")
+		return Response{}, fmt.Errorf("worker report delivery requires the persistent orchestrator")
 	}
 	if maxOutput <= 0 || maxOutput > a.Config.MaxReplyBytes {
-		return "", fmt.Errorf("invalid worker report response limit")
+		return Response{}, fmt.Errorf("invalid worker report response limit")
 	}
 	if _, err := a.PersistentResponder.Prepare(ctx); err != nil {
-		return "", fmt.Errorf("prepare worker report responder: %w", err)
+		return Response{}, fmt.Errorf("prepare worker report responder: %w", err)
 	}
 	response, err := a.PersistentResponder.Respond(ctx, prompt, maxOutput)
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(response.Reply), nil
+	response.Reply = strings.TrimSpace(response.Reply)
+	return response, err
 }
 
 func (a Adapter) Close() error {
@@ -681,7 +702,8 @@ func ParseMessages(data []byte) ([]Message, error) {
 func normalize(raw map[string]any, index int) Message {
 	text := stringValue(raw, "text", "message", "body")
 	created := stringValue(raw, "createdAt", "created_at", "date", "time", "timestamp")
-	id := stringValue(raw, "id", "guid", "messageId", "message_id", "rowid")
+	guid := stringValue(raw, "guid", "messageGuid", "message_guid")
+	id := stringValue(raw, "id", "messageId", "message_id", "rowid", "guid")
 	if id == "" {
 		digest := sha256.Sum256([]byte(created + "\x00" + text + "\x00" + strconv.Itoa(index)))
 		id = "msg-" + hex.EncodeToString(digest[:8])
@@ -691,7 +713,17 @@ func normalize(raw map[string]any, index int) Message {
 	if direction == "outgoing" || direction == "sent" || direction == "me" {
 		fromMe = true
 	}
-	return Message{ID: id, Text: text, CreatedAt: created, ChatID: chatValue(raw), FromMe: fromMe}
+	threadRootGUID := stringValue(raw, "threadOriginatorGuid", "thread_originator_guid", "replyToGuid", "reply_to_guid", "threadRootGuid", "thread_root_guid")
+	return Message{
+		ID:             id,
+		GUID:           guid,
+		ThreadRootGUID: threadRootGUID,
+		Text:           text,
+		CreatedAt:      created,
+		ChatID:         chatValue(raw),
+		ChatGUID:       stringValue(raw, "chatGuid", "chat_guid"),
+		FromMe:         fromMe,
+	}
 }
 
 func chatValue(raw map[string]any) string {

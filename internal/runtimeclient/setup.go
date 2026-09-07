@@ -25,6 +25,7 @@ type RuntimeConfig struct {
 	DefaultBackend            string                 `json:"defaultBackend"`
 	TmuxSession               string                 `json:"tmuxSession"`
 	HerdrPath                 string                 `json:"herdrPath,omitempty"`
+	ImsgPath                  string                 `json:"imsgPath,omitempty"`
 	HerdrSession              string                 `json:"herdrSession"`
 	FullAIHerdrWorkspaceLabel string                 `json:"fullAIHerdrWorkspaceLabel"`
 	Agents                    map[string]AgentConfig `json:"agents"`
@@ -113,11 +114,12 @@ func Initialize() ([]string, error) {
 		fullAIHerdrWorkspaceLabel = value
 	}
 	herdrPath, _ := ResolveExecutable("herdr")
+	imsgPath, _ := ResolveExecutable("imsg")
 	delegateAgent := ""
 	if _, ok := agents["pi"]; ok {
 		delegateAgent = "pi"
 	}
-	cfg := RuntimeConfig{Host: "127.0.0.1", Port: port, StateDir: dir, TokenFile: tokenPath, NodePath: nodePath, DefaultBackend: backend, TmuxSession: "context-drop", HerdrPath: herdrPath, HerdrSession: herdrSession, FullAIHerdrWorkspaceLabel: fullAIHerdrWorkspaceLabel, Agents: agents, DelegateAgent: delegateAgent, RepoAliases: map[string]string{}}
+	cfg := RuntimeConfig{Host: "127.0.0.1", Port: port, StateDir: dir, TokenFile: tokenPath, NodePath: nodePath, DefaultBackend: backend, TmuxSession: "context-drop", HerdrPath: herdrPath, ImsgPath: imsgPath, HerdrSession: herdrSession, FullAIHerdrWorkspaceLabel: fullAIHerdrWorkspaceLabel, Agents: agents, DelegateAgent: delegateAgent, RepoAliases: map[string]string{}}
 	if hasExisting {
 		if existing.Host == "127.0.0.1" || existing.Host == "::1" {
 			cfg.Host = existing.Host
@@ -133,6 +135,9 @@ func Initialize() ([]string, error) {
 		}
 		if validExecutable(existing.HerdrPath) == nil {
 			cfg.HerdrPath = existing.HerdrPath
+		}
+		if validExecutable(existing.ImsgPath) == nil {
+			cfg.ImsgPath = existing.ImsgPath
 		}
 		if os.Getenv("CONTEXT_DROP_HERDR_SESSION") == "" && existing.HerdrSession != "" {
 			cfg.HerdrSession = existing.HerdrSession
@@ -323,6 +328,11 @@ func LoadConfig() (RuntimeConfig, error) {
 	if cfg.HerdrPath != "" {
 		if err := validExecutable(cfg.HerdrPath); err != nil {
 			return RuntimeConfig{}, fmt.Errorf("runtime herdrPath: %w; run context-drop init again", err)
+		}
+	}
+	if cfg.ImsgPath != "" {
+		if err := validExecutable(cfg.ImsgPath); err != nil {
+			return RuntimeConfig{}, fmt.Errorf("runtime imsgPath: %w; run context-drop init again", err)
 		}
 	}
 	if err := validExecutable(cfg.NodePath); err != nil {

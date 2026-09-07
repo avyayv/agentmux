@@ -14,12 +14,16 @@ export interface RuntimeConfig {
   defaultBackend?: SessionBackend;
   tmuxSession: string;
   herdrPath?: string;
+  imsgPath?: string;
   herdrSession?: string;
   fullAIHerdrWorkspaceLabel?: string;
   agents: Record<string, AgentConfig>;
   delegateAgent?: string;
   /** Explicit, private aliases for repositories the trusted router may launch in. */
   repoAliases?: Record<string, string>;
+  /** Test/advanced override for bounded Herdr registration readiness. */
+  herdrReadinessMs?: number;
+  herdrReadinessPollMs?: number;
 }
 
 export interface RunRecord {
@@ -72,6 +76,12 @@ export interface ParentReport {
   leaseUntil?: string;
   deliveredAt?: string;
   lifecycleOnly?: boolean;
+  lifecycleStatus?: "completed" | "failed";
+  deliveryAttempts?: number;
+  lastDeliveryError?: string;
+  nextAttemptAt?: string;
+  abandonedAt?: string;
+  threadId?: string;
   challengeConsumedAt?: string;
   challengeReservationId?: string;
   challengeReservationUntil?: string;

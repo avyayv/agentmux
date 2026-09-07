@@ -4,16 +4,17 @@ import { join } from "node:path";
 import type { AgentConfig, LaunchRequest, RuntimeConfig } from "./types.js";
 
 export interface CommandResult { status: number | null; stdout?: string; stderr?: string }
+export interface CommandOptions { timeoutMs?: number }
 export class LaunchOutcomeUnknownError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "LaunchOutcomeUnknownError";
   }
 }
-export interface CommandRunner { run(command: string, args: string[]): CommandResult }
+export interface CommandRunner { run(command: string, args: string[], options?: CommandOptions): CommandResult }
 export const systemRunner: CommandRunner = {
-  run(command, args) {
-    const result = spawnSync(command, args, { encoding: "utf8" });
+  run(command, args, options) {
+    const result = spawnSync(command, args, { encoding: "utf8", timeout: options?.timeoutMs, maxBuffer: 1024 * 1024 });
     return { status: result.status, stdout: result.stdout, stderr: result.stderr || result.error?.message };
   },
 };

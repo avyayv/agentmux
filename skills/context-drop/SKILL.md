@@ -65,6 +65,8 @@ context-drop schedule add --name test-watch \
   --prompt "Inspect current test failures and report naturally." \
   --every 1h --notify
 context-drop schedule list
+context-drop schedule test-watch          # show stored prompt
+context-drop schedule test-watch "New prompt"  # update only the prompt
 context-drop schedule run test-watch
 context-drop schedule remove test-watch
 ```

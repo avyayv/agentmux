@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -46,6 +47,10 @@ func NewIMsgRPCSender(cfg Config) *IMsgRPCSender {
 }
 
 func (s *IMsgRPCSender) Send(ctx context.Context, chatID, text string) error {
+	rowID, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil || rowID <= 0 {
+		return errors.New("imsg RPC chat ID must be a positive integer")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.unsupported {
@@ -61,7 +66,7 @@ func (s *IMsgRPCSender) Send(ctx context.Context, chatID, text string) error {
 		"jsonrpc": "2.0",
 		"id":      id,
 		"method":  "send",
-		"params":  map[string]any{"chat_id": chatID, "text": text},
+		"params":  map[string]any{"chat_id": rowID, "text": text},
 	}
 	if err := s.writeLocked(request); err != nil {
 		s.stopLocked()

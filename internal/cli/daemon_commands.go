@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -221,11 +223,14 @@ func newScheduleCommand() *cobra.Command {
 			if s.Cron != "" {
 				cadence = fmt.Sprintf("%s (%s)", s.Cron, s.Timezone)
 			}
-			jobStatus := "none"
+			jobStatus, deliveryStatus := "none", "n/a"
 			if job, ok := latest[s.Name]; ok {
 				jobStatus = job.Status
+				if job.DeliveryStatus != "" {
+					deliveryStatus = job.DeliveryStatus
+				}
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\ttype=%s\toverlap=%s\tbackend=%s\tagent=%s\ttarget=%s\tenabled=%t\tfailures=%d\tjob=%s\tnext=%s\n", s.Name, cadence, s.Type, s.Overlap, s.Backend, s.Agent, s.WatchPane+s.WatchTarget, s.Enabled, s.ConsecutiveFailures, jobStatus, s.NextRunAt.Format(time.RFC3339))
+			fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\ttype=%s\toverlap=%s\tbackend=%s\tagent=%s\ttarget=%s\tenabled=%t\tfailures=%d\tjob=%s\tdelivery=%s\tnext=%s\n", s.Name, cadence, s.Type, s.Overlap, s.Backend, s.Agent, s.WatchPane+s.WatchTarget, s.Enabled, s.ConsecutiveFailures, jobStatus, deliveryStatus, s.NextRunAt.Format(time.RFC3339))
 		}
 		return nil
 	}}
@@ -263,7 +268,79 @@ func newScheduleCommand() *cobra.Command {
 		}}
 	}
 	root.AddCommand(add, list, remove, run, setEnabled(false), setEnabled(true))
+	root.RunE = func(cmd *cobra.Command, args []string) error {
+		switch {
+		case len(args) == 0:
+			return cmd.Help()
+		case len(args) == 1:
+			return showSchedulePrompt(cmd, args[0])
+		case len(args) == 2:
+			return setSchedulePrompt(cmd, args[0], args[1])
+		default:
+			return fmt.Errorf("usage: context-drop schedule <name> [prompt]; pass - as the prompt to read it from stdin")
+		}
+	}
 	return root
+}
+
+// showSchedulePrompt prints one schedule's exact stored prompt.
+func showSchedulePrompt(cmd *cobra.Command, name string) error {
+	store, err := orchestrator.NewStore()
+	if err != nil {
+		return err
+	}
+	st, err := store.Load()
+	if err != nil {
+		return err
+	}
+	for _, s := range st.Schedules {
+		if s.Name == name {
+			fmt.Fprintf(cmd.OutOrStdout(), "%s (%s)\n---\n%s\n---\n", s.Name, cadenceOf(s), s.Prompt)
+			return nil
+		}
+	}
+	return fmt.Errorf("schedule %q not found", name)
+}
+
+// setSchedulePrompt replaces one existing schedule's prompt in place, keeping
+// every other field (cadence, agent, backend, repo) untouched.
+func setSchedulePrompt(cmd *cobra.Command, name, prompt string) error {
+	if prompt == "-" {
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+		prompt = string(data)
+	}
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return fmt.Errorf("prompt must not be empty")
+	}
+	store, err := orchestrator.NewStore()
+	if err != nil {
+		return err
+	}
+	if err := store.Update(func(st *orchestrator.State) error {
+		for i := range st.Schedules {
+			if st.Schedules[i].Name != name {
+				continue
+			}
+			st.Schedules[i].Prompt = prompt
+			return nil
+		}
+		return fmt.Errorf("schedule %q not found; use schedule add to create one", name)
+	}); err != nil {
+		return err
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "updated prompt for schedule %s\n", name)
+	return nil
+}
+
+func cadenceOf(s orchestrator.Schedule) string {
+	if s.Cron != "" {
+		return fmt.Sprintf("cron %s (%s)", s.Cron, s.Timezone)
+	}
+	return s.Every.String()
 }
 
 func runScheduleOnce(ctx context.Context, cmd *cobra.Command, name string) error {

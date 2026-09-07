@@ -33,6 +33,17 @@ func TestIMsgRPCSenderReusesOneProcess(t *testing.T) {
 	}
 }
 
+func TestIMsgRPCSenderRejectsInvalidChatBeforeStarting(t *testing.T) {
+	for _, id := range []string{"", "0", "-1", "chat-guid", "9223372036854775808"} {
+		t.Run(id, func(t *testing.T) {
+			sender := &IMsgRPCSender{}
+			if err := sender.Send(context.Background(), id, "hello"); err == nil || !strings.Contains(err.Error(), "positive integer") {
+				t.Fatalf("Send() = %v", err)
+			}
+		})
+	}
+}
+
 func TestIMsgRPCSenderReportsUnsupportedCommand(t *testing.T) {
 	path := writeWatchFixture(t, "echo 'Error: unknown command rpc' >&2\nexit 2\n")
 	sender := &IMsgRPCSender{argv: []string{path, "rpc"}}
@@ -64,14 +75,14 @@ func TestIMsgRPCHelperProcess(t *testing.T) {
 			ID     string `json:"id"`
 			Method string `json:"method"`
 			Params struct {
-				ChatID string `json:"chat_id"`
+				ChatID int64  `json:"chat_id"`
 				Text   string `json:"text"`
 			} `json:"params"`
 		}
 		if json.Unmarshal(scanner.Bytes(), &request) != nil {
 			continue
 		}
-		if request.Method != "send" || request.Params.ChatID != "1" || request.Params.Text == "" {
+		if request.Method != "send" || request.Params.ChatID != 1 || request.Params.Text == "" {
 			_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": map[string]any{"code": -32602, "message": "bad request"}})
 			continue
 		}

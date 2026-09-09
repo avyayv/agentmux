@@ -21,3 +21,9 @@ jobs:
           cache: true
 
       - run: make coverage
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: python3 -m unittest discover -s workflows/herdr-activity-summary -p 'test_*.py'

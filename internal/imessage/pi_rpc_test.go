@@ -289,7 +289,7 @@ func TestPiRPCResponderPreservesSuccessfulToolEvidenceOnEmptyFinal(t *testing.T)
 	}
 }
 
-func TestPiRPCResponderTracksMessagingSideEffectsOnEmptyFinal(t *testing.T) {
+func TestPiRPCResponderAcceptsEmptyFinalAfterSuccessfulMessagingTool(t *testing.T) {
 	for _, test := range []struct {
 		name            string
 		tool            string
@@ -305,7 +305,7 @@ func TestPiRPCResponderTracksMessagingSideEffectsOnEmptyFinal(t *testing.T) {
 				t.Fatal(err)
 			}
 			response, err := responder.Respond(context.Background(), "message", 1024)
-			if err == nil || !response.ToolCompleted || !response.SideEffectToolCompleted || !response.MessagingSideEffectToolCompleted || response.ThreadReplyToolCompleted != test.wantThreadReply {
+			if err != nil || response.Reply != "" || !response.ToolCompleted || !response.SideEffectToolCompleted || !response.MessagingSideEffectToolCompleted || response.ThreadReplyToolCompleted != test.wantThreadReply {
 				t.Fatalf("response=%#v err=%v", response, err)
 			}
 		})
@@ -313,14 +313,18 @@ func TestPiRPCResponderTracksMessagingSideEffectsOnEmptyFinal(t *testing.T) {
 }
 
 func TestPiRPCResponderDoesNotCountFailedSideEffectTool(t *testing.T) {
-	responder := &PiRPCResponder{argv: []string{os.Args[0], "-test.run=TestPiRPCHelperProcess"}, env: append(os.Environ(), "CONTEXT_DROP_PI_RPC_HELPER=1", "CONTEXT_DROP_PI_RPC_MESSAGE_COUNT=2", "CONTEXT_DROP_PI_RPC_EMPTY_AFTER_TOOL=1", "CONTEXT_DROP_PI_RPC_TOOL_ERROR=1")}
-	defer responder.Close()
-	if _, err := responder.Prepare(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	response, err := responder.Respond(context.Background(), "delegate", 1024)
-	if err == nil || response.ToolCompleted || response.SideEffectToolCompleted {
-		t.Fatalf("response=%#v err=%v", response, err)
+	for _, tool := range []string{"delegate_task", "reply_to_thread", "react_to_thread"} {
+		t.Run(tool, func(t *testing.T) {
+			responder := &PiRPCResponder{argv: []string{os.Args[0], "-test.run=TestPiRPCHelperProcess"}, env: append(os.Environ(), "CONTEXT_DROP_PI_RPC_HELPER=1", "CONTEXT_DROP_PI_RPC_MESSAGE_COUNT=2", "CONTEXT_DROP_PI_RPC_EMPTY_AFTER_TOOL=1", "CONTEXT_DROP_PI_RPC_TOOL_ERROR=1", "CONTEXT_DROP_PI_RPC_TOOL_NAME="+tool)}
+			defer responder.Close()
+			if _, err := responder.Prepare(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			response, err := responder.Respond(context.Background(), "message", 1024)
+			if err == nil || response.ToolCompleted || response.SideEffectToolCompleted || response.MessagingSideEffectToolCompleted || response.ThreadReplyToolCompleted {
+				t.Fatalf("response=%#v err=%v", response, err)
+			}
+		})
 	}
 }
 

@@ -71,7 +71,7 @@ export default function (pi) {
   });
   pi.registerTool({
     name: "reply_to_thread", label: "Reply in iMessage thread",
-    description: "Send text as a reply in an exact active iMessage thread. After sending the user-facing response with this tool, return exactly CONTEXT_DROP_NO_USER_REPLY_V1 to prevent a duplicate unthreaded message.",
+    description: "Send text as a reply in an exact active iMessage thread. After this tool succeeds, end the turn without additional text; the daemon automatically prevents duplicate delivery.",
     parameters: Type.Object({ threadId: Type.String({ minLength: 1, maxLength: 128 }), text: Type.String({ minLength: 1, maxLength: 16000 }) }),
     async execute(_id, input, signal) { const result = await request("/v1/imessage/threads/reply", "POST", input, signal); return { content: [{ type: "text", text: "thread reply sent" }], details: result }; },
   });

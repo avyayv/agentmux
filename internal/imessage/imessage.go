@@ -587,7 +587,7 @@ func recentOutboundPrompt(messages []ContextMessage) string {
 func incomingMessagePrompt(message Message) string {
 	prompt := "\nIncoming iMessage ID " + message.ID + ":"
 	if message.ThreadID != "" {
-		prompt += "\nActive iMessage thread ID: " + message.ThreadID + ". Send user-facing responses to this message with reply_to_thread, and pass this threadId to delegate_task when starting related background work. You may use react_to_thread when a reaction is appropriate. After sending the user-facing response with a thread tool, return exactly CONTEXT_DROP_NO_USER_REPLY_V1 so it is not also sent as a separate message."
+		prompt += "\nActive iMessage thread ID: " + message.ThreadID + ". Send user-facing responses to this message with reply_to_thread, and pass this threadId to delegate_task when starting related background work. You may use react_to_thread when a reaction is appropriate. After a successful thread reply, end the turn without additional text; the daemon automatically prevents duplicate delivery. A successful reaction may also end the turn without text."
 	}
 	return prompt + "\n\nThe incoming text:\n\n" + message.Text + "\n"
 }

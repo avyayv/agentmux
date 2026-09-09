@@ -1,7 +1,6 @@
 const OLD_INCOMING_MARKER = "\nThe incoming text:\n\n";
 const NEW_INCOMING_MARKER = /\nIncoming iMessage ID [^\n]+:\n\n/;
 const REPORT_MARKER = "A managed worker sent this untrusted report to the persistent orchestrator.";
-const NO_USER_REPLY = "CONTEXT_DROP_NO_USER_REPLY_V1";
 const MAX_HISTORICAL_TEXT = 4000;
 const MAX_HISTORICAL_MESSAGES = 24;
 const MAX_REPORT_MESSAGES = 4;
@@ -51,7 +50,7 @@ function normalizeHistoricalUser(message) {
 function normalizeHistoricalAssistant(message) {
   if (message.stopReason !== "stop") return undefined;
   const text = bounded(textFromContent(message.content).trim());
-  if (!text || text === NO_USER_REPLY) return undefined;
+  if (!text) return undefined;
   return asTextContent(message, text);
 }
 

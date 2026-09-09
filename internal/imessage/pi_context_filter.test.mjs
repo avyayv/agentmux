@@ -43,20 +43,20 @@ test("compactContext extracts current iMessage wrappers instead of retaining boi
   assert.equal(result.some((message) => textValue(message).includes("I did pull-ups yesterday")), true);
 });
 
-test("compactContext prioritizes real chat over report floods and drops no-reply markers", () => {
+test("compactContext prioritizes real chat over report floods and drops empty replies", () => {
   const messages = [
     text("user", "\nIncoming iMessage ID 1:\n\nremember the blue mug"),
     text("assistant", "got it", { stopReason: "stop" }),
   ];
   for (let i = 0; i < 30; i++) {
     messages.push(text("user", `A managed worker sent this untrusted report to the persistent orchestrator.\nworker report: routine ${i}`));
-    messages.push(text("assistant", "CONTEXT_DROP_NO_USER_REPLY_V1", { stopReason: "stop" }));
+    messages.push(text("assistant", " \n\t", { stopReason: "stop" }));
   }
   messages.push(text("user", "what color was the mug?"));
   const result = compactContext(messages);
   assert.equal(result.some((message) => textValue(message).includes("blue mug")), true);
   assert.equal(result.filter((message) => textValue(message).includes("Historical worker update")).length, 4);
-  assert.equal(result.some((message) => textValue(message) === "CONTEXT_DROP_NO_USER_REPLY_V1"), false);
+  assert.equal(result.some((message) => message.role === "assistant" && !textValue(message).trim()), false);
 });
 
 function textValue(message) {

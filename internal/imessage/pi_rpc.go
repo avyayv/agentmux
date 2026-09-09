@@ -560,7 +560,7 @@ func (r *PiRPCResponder) Respond(ctx context.Context, prompt string, maxOutput i
 				return Response{Metrics: startupMetrics}, errors.New("Pi RPC agent settled before accepting the prompt")
 			}
 			reply = strings.TrimSpace(reply)
-			if reply == "" {
+			if reply == "" && !messagingSideEffectCompleted {
 				return Response{Metrics: startupMetrics, MessagingSideEffectToolCompleted: messagingSideEffectCompleted, ThreadReplyToolCompleted: threadReplyCompleted, ToolCompleted: toolCompleted, SideEffectToolCompleted: sideEffectCompleted}, &ResponderTurnError{Cause: errors.New("Pi RPC responder returned an empty reply"), ToolCompleted: toolCompleted, SideEffectToolCompleted: sideEffectCompleted}
 			}
 			if len(reply) > maxOutput {

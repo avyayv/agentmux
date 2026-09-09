@@ -561,7 +561,7 @@ func (r *recordingResponder) Respond(_ context.Context, p string, _ int) (imessa
 func (*recordingResponder) Close() error { return nil }
 func TestIncomingMessageRegistersOpaqueThreadAndSuppressesDuplicateReply(t *testing.T) {
 	commander := &reportCommander{}
-	responder := &recordingResponder{response: imessage.Response{ToolCompleted: true, MessagingSideEffectToolCompleted: true, ThreadReplyToolCompleted: true}}
+	responder := &recordingResponder{response: imessage.Response{Reply: "Already replied in the thread.", ToolCompleted: true, MessagingSideEffectToolCompleted: true, ThreadReplyToolCompleted: true}}
 	backend := &fakeDelegationRuntime{registeredID: "thread-opaque"}
 	cfg := imessage.Defaults()
 	cfg.Enabled = true
